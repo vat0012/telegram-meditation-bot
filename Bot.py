@@ -1,8 +1,9 @@
 import asyncio
 import calendar
-from datetime import datetime, time, timedelta
+import html
 import logging
 import os
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import asyncpg
@@ -18,46 +19,57 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telegram.helpers import escape_markdown
+
+# =========================================================
+# BASIC SETTINGS
+# =========================================================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("dhyan_bot")
 
-# =========================================================
-# CONFIGURATION
-# =========================================================
-
-TOKEN = os.getenv("BOT_TOKEN", "8046423951:AAFK9boL0QaXuidtpKvDmRYjj06txjYI01A")
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://neondb_owner:npg_KCSP91Nqtzfk@ep-bold-hall-azziesr6-pooler.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
-)
+# Put these in your hosting platform's Environment Variables.
+# Do NOT put real secrets directly into this file.
+TOKEN = os.getenv("BOT_TOKEN", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 GROUP_ID = int(os.getenv("GROUP_ID", "-4721378655"))
+
 TIMEZONE = ZoneInfo("Asia/Kolkata")
 SESSION_MINUTES = 20
 
 DB_POOL = None
 
 
-def get_current_date() -> str:
+# =========================================================
+# SMALL HELPERS
+# =========================================================
+
+def today_date() -> str:
+    """Return today's date in India (YYYY-MM-DD)."""
     return datetime.now(TIMEZONE).date().isoformat()
 
 
-def esc(text: object) -> str:
-    return escape_markdown(str(text), version=2)
+def safe_text(value: object) -> str:
+    """Escape text safely for Telegram HTML messages."""
+    return html.escape(str(value))
 
 
-def get_title(sessions: int) -> str:
-    if sessions >= 150:
+def display_name(user) -> str:
+    """Get the nicest available name for a Telegram user."""
+    return user.first_name or user.username or "Practitioner"
+
+
+def get_title(total_sessions: int) -> str:
+    """Give a simple title based on lifetime practice."""
+    if total_sessions >= 150:
         return "Master of Stillness 🏔️"
-    if sessions >= 75:
+    if total_sessions >= 75:
         return "Dhyan Practitioner 🌿"
-    if sessions >= 30:
+    if total_sessions >= 30:
         return "Mindful Seeker 🌊"
-    if sessions >= 10:
+    if total_sessions >= 10:
         return "Consistent Sitter 🌱"
     return "Beginner ✨"
 
@@ -66,13 +78,26 @@ def get_title(sessions: int) -> str:
 # DATABASE
 # =========================================================
 
-async def setup_database():
+async def setup_database() -> None:
+    """Connect to PostgreSQL and create the attendance table if needed."""
     global DB_POOL
-    clean_url = DATABASE_URL.replace("&channel_binding=require", "").replace("postgres://", "postgresql://")
-    DB_POOL = await asyncpg.create_pool(dsn=clean_url, min_size=1, max_size=10, command_timeout=30)
+
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set.")
+
+    clean_url = DATABASE_URL.replace("&channel_binding=require", "")
+    clean_url = clean_url.replace("postgres://", "postgresql://")
+
+    DB_POOL = await asyncpg.create_pool(
+        dsn=clean_url,
+        min_size=1,
+        max_size=10,
+        command_timeout=30,
+    )
 
     async with DB_POOL.acquire() as conn:
-        await conn.execute("""
+        await conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS attendance (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL,
@@ -82,29 +107,42 @@ async def setup_database():
                 duration_minutes INT DEFAULT 20,
                 UNIQUE(user_id, attendance_date, session)
             );
-            CREATE INDEX IF NOT EXISTS idx_user_date ON attendance(user_id, attendance_date);
-            CREATE INDEX IF NOT EXISTS idx_date_session ON attendance(attendance_date, session);
-        """)
-    logger.info("Database schema initialized.")
+
+            CREATE INDEX IF NOT EXISTS idx_user_date
+                ON attendance(user_id, attendance_date);
+
+            CREATE INDEX IF NOT EXISTS idx_date_session
+                ON attendance(attendance_date, session);
+            """
+        )
+
+    logger.info("Database is ready.")
 
 
 async def calculate_streak(user_id: int) -> int:
+    """Count consecutive practice days, starting from today or yesterday."""
     async with DB_POOL.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT DISTINCT attendance_date 
-            FROM attendance 
-            WHERE user_id = $1 
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT attendance_date
+            FROM attendance
+            WHERE user_id = $1
             ORDER BY attendance_date DESC
-        """, user_id)
+            """,
+            user_id,
+        )
 
     if not rows:
         return 0
 
-    dates = {datetime.strptime(r["attendance_date"], "%Y-%m-%d").date() for r in rows}
-    today = datetime.now(TIMEZONE).date()
-    yesterday = today - timedelta(days=1)
+    dates = {
+        datetime.strptime(row["attendance_date"], "%Y-%m-%d").date()
+        for row in rows
+    }
 
-    current = today if today in dates else yesterday
+    today = datetime.now(TIMEZONE).date()
+    current = today if today in dates else today - timedelta(days=1)
+
     if current not in dates:
         return 0
 
@@ -112,6 +150,7 @@ async def calculate_streak(user_id: int) -> int:
     while current in dates:
         streak += 1
         current -= timedelta(days=1)
+
     return streak
 
 
@@ -119,418 +158,719 @@ async def calculate_streak(user_id: int) -> int:
 # KEYBOARDS
 # =========================================================
 
-def build_menu_keyboard(date_str: str = None, session: str = "daily", count: int = 0) -> InlineKeyboardMarkup:
-    target_date = date_str or get_current_date()
-    count_tag = f" ({count})" if count > 0 else ""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"✅ Check In Today{count_tag}", callback_data=f"attend:{target_date}:{session}")],
+
+def main_menu_keyboard(
+    date_str: str | None = None,
+    session: str = "daily",
+    count: int = 0,
+) -> InlineKeyboardMarkup:
+    """Main menu shown under attendance messages."""
+    target_date = date_str or today_date()
+    count_text = f" ({count})" if count else ""
+
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("👤 My Stats", callback_data="menu:mystats"),
-            InlineKeyboardButton("📅 Calendar", callback_data="menu:grid")
-        ],
-        [
-            InlineKeyboardButton("🏆 Leaderboard", callback_data="menu:leaderboard"),
-            InlineKeyboardButton("📊 Community", callback_data="menu:report")
+            [
+                InlineKeyboardButton(
+                    f"✅ Check in today{count_text}",
+                    callback_data=f"attend:{target_date}:{session}",
+                )
+            ],
+            [
+                InlineKeyboardButton("👤 My stats", callback_data="menu:mystats"),
+                InlineKeyboardButton("📅 My calendar", callback_data="menu:grid"),
+            ],
+            [
+                InlineKeyboardButton("🏆 Leaderboard", callback_data="menu:leaderboard"),
+                InlineKeyboardButton("📊 Community", callback_data="menu:report"),
+            ],
         ]
-    ])
+    )
 
 
-def build_calendar_keyboard(year: int, month: int) -> InlineKeyboardMarkup:
-    prev_mo = month - 1 if month > 1 else 12
-    prev_yr = year if month > 1 else year - 1
-    next_mo = month + 1 if month < 12 else 1
-    next_yr = year if month < 12 else year + 1
+def calendar_keyboard(year: int, month: int) -> InlineKeyboardMarkup:
+    """Navigation buttons for the monthly calendar."""
+    previous_month = month - 1 if month > 1 else 12
+    previous_year = year if month > 1 else year - 1
 
-    return InlineKeyboardMarkup([
+    next_month = month + 1 if month < 12 else 1
+    next_year = year if month < 12 else year + 1
+
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("◀️ Prev", callback_data=f"cal:{prev_yr}:{prev_mo:02d}"),
-            InlineKeyboardButton("Next ▶️", callback_data=f"cal:{next_yr}:{next_mo:02d}"),
-        ],
-        [InlineKeyboardButton("🏠 Main Menu", callback_data="menu:main")]
-    ])
+            [
+                InlineKeyboardButton(
+                    "◀️ Previous",
+                    callback_data=f"cal:{previous_year}:{previous_month:02d}",
+                ),
+                InlineKeyboardButton(
+                    "Next ▶️",
+                    callback_data=f"cal:{next_year}:{next_month:02d}",
+                ),
+            ],
+            [InlineKeyboardButton("🏠 Main menu", callback_data="menu:main")],
+        ]
+    )
 
 
-async def send_response(update_or_query, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
+def back_to_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🏠 Main menu", callback_data="menu:main")]]
+    )
+
+
+def calendar_button() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📅 Open my calendar", callback_data="menu:grid")]]
+    )
+
+
+# =========================================================
+# TELEGRAM MESSAGE HELPER
+# =========================================================
+
+async def send_message(
+    update_or_query,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    reply_markup=None,
+) -> None:
+    """Send a message whether the caller is a command or a button press."""
     try:
         if isinstance(update_or_query, Update) and update_or_query.message:
-            await update_or_query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=reply_markup)
+            await update_or_query.message.reply_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+            )
+            return
+
+        if getattr(update_or_query, "message", None):
+            chat_id = update_or_query.message.chat_id
         else:
-            chat_id = update_or_query.message.chat_id if update_or_query.message else update_or_query.from_user.id
-            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=reply_markup)
-    except TelegramError as e:
-        logger.error(f"Error sending message: {e}")
+            chat_id = update_or_query.from_user.id
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
+        )
+
+    except TelegramError as exc:
+        logger.error("Could not send message: %s", exc)
 
 
 # =========================================================
-# AESTHETIC CARDS & REPORTS
+# HOME / WELCOME
 # =========================================================
 
-async def send_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, user, target_year: int = None, target_month: int = None, edit_message: bool = False):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Open the main attendance screen."""
+    current_date = today_date()
+
+    async with DB_POOL.acquire() as conn:
+        total_today = await conn.fetchval(
+            "SELECT COUNT(*) FROM attendance WHERE attendance_date = $1",
+            current_date,
+        ) or 0
+
+    text = (
+        "🧘 <b>Dhyan Tracker</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📅 <b>Today:</b> {safe_text(current_date)}\n"
+        f"⏱ <b>Practice:</b> {SESSION_MINUTES} minutes\n\n"
+        "Use <b>Check in today</b> after completing your practice.\n"
+        "You can also open your stats, calendar, or the community report below."
+    )
+
+    await send_message(
+        update,
+        context,
+        text,
+        reply_markup=main_menu_keyboard(current_date, "daily", total_today),
+    )
+
+
+async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Welcome new members and show them the check-in button."""
+    current_date = today_date()
+
+    for member in update.message.new_chat_members:
+        if member.id == context.bot.id:
+            continue
+
+        name = display_name(member)
+        text = (
+            f"🙏 <b>Welcome, {safe_text(name)}!</b>\n\n"
+            f"Your daily Dhyan practice is <b>{SESSION_MINUTES} minutes</b>.\n"
+            "After you finish, tap the button below to record your attendance."
+        )
+
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard(current_date, "daily"),
+        )
+
+
+# =========================================================
+# PERSONAL STATS
+# =========================================================
+
+async def send_user_stats(
+    update_or_query,
+    context: ContextTypes.DEFAULT_TYPE,
+    user,
+) -> None:
+    """Show the user's current month and lifetime practice."""
+    user_id = user.id
+    month_prefix = datetime.now(TIMEZONE).strftime("%Y-%m")
+
+    async with DB_POOL.acquire() as conn:
+        month_row = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) AS sessions,
+                COUNT(DISTINCT attendance_date) AS days
+            FROM attendance
+            WHERE user_id = $1
+              AND attendance_date LIKE $2
+            """,
+            user_id,
+            f"{month_prefix}%",
+        )
+
+        lifetime_row = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) AS sessions,
+                COUNT(DISTINCT attendance_date) AS days
+            FROM attendance
+            WHERE user_id = $1
+            """,
+            user_id,
+        )
+
+        monthly_ranks = await conn.fetch(
+            """
+            SELECT user_id, COUNT(*) AS sessions
+            FROM attendance
+            WHERE attendance_date LIKE $1
+            GROUP BY user_id
+            ORDER BY sessions DESC, user_id
+            """,
+            f"{month_prefix}%",
+        )
+
+    month_sessions = int(month_row["sessions"] or 0)
+    month_days = int(month_row["days"] or 0)
+    lifetime_sessions = int(lifetime_row["sessions"] or 0)
+    lifetime_days = int(lifetime_row["days"] or 0)
+
+    ranking_ids = [row["user_id"] for row in monthly_ranks]
+    rank = ranking_ids.index(user_id) + 1 if user_id in ranking_ids else None
+
+    streak = await calculate_streak(user_id)
+    name = display_name(user)
+    title = get_title(lifetime_sessions)
+    month_name = datetime.now(TIMEZONE).strftime("%B %Y")
+
+    rank_text = f"#{rank}" if rank else "Not ranked yet"
+    next_text = "Keep going — every session counts." if lifetime_sessions < 10 else "Great consistency. Keep building your streak."
+
+    text = (
+        "👤 <b>My Dhyan Stats</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🧘 <b>{safe_text(name)}</b>\n"
+        f"🌿 {safe_text(title)}\n\n"
+        "<b>This month</b>\n"
+        f"• Practice days: <b>{month_days}</b>\n"
+        f"• Total sessions: <b>{month_sessions}</b>\n"
+        f"• Monthly rank: <b>{safe_text(rank_text)}</b>\n\n"
+        "<b>All time</b>\n"
+        f"• Practice days: <b>{lifetime_days}</b>\n"
+        f"• Total sessions: <b>{lifetime_sessions}</b>\n"
+        f"• Current streak: <b>{streak} days 🔥</b>\n\n"
+        f"💡 {safe_text(next_text)}"
+    )
+
+    await send_message(update_or_query, context, text, reply_markup=calendar_button())
+
+
+# =========================================================
+# CALENDAR
+# =========================================================
+
+async def send_calendar(
+    update_or_query,
+    context: ContextTypes.DEFAULT_TYPE,
+    user,
+    target_year: int | None = None,
+    target_month: int | None = None,
+    edit_message: bool = False,
+) -> None:
+    """Show one month of the user's attendance."""
     now = datetime.now(TIMEZONE).date()
     year = target_year or now.year
     month = target_month or now.month
 
     month_prefix = f"{year}-{month:02d}"
-    month_dt = datetime(year, month, 1)
-    month_name = month_dt.strftime("%B %Y")
+    month_name = datetime(year, month, 1).strftime("%B %Y")
     days_in_month = calendar.monthrange(year, month)[1]
 
     async with DB_POOL.acquire() as conn:
         records = await conn.fetch(
             """
-            SELECT attendance_date, session, duration_minutes 
-            FROM attendance 
-            WHERE user_id = $1 AND attendance_date LIKE $2
+            SELECT attendance_date, duration_minutes
+            FROM attendance
+            WHERE user_id = $1
+              AND attendance_date LIKE $2
             ORDER BY attendance_date ASC
             """,
-            user.id, f"{month_prefix}%"
+            user.id,
+            f"{month_prefix}%",
         )
 
-    month_data = {}
+    completed_days = set()
     total_minutes = 0
-    for r in records:
-        day_num = int(r["attendance_date"].split("-")[2])
-        month_data.setdefault(day_num, []).append(r["session"])
-        total_minutes += (r["duration_minutes"] or SESSION_MINUTES)
 
-    active_days = len(month_data)
-    rate = int((active_days / days_in_month) * 100)
+    for row in records:
+        day = int(row["attendance_date"].split("-")[2])
+        completed_days.add(day)
+        total_minutes += row["duration_minutes"] or SESSION_MINUTES
 
-    # Minimalist ASCII Calendar
-    cal = calendar.monthcalendar(year, month)
-    header = f"  {month_name.upper()}"
+    active_days = len(completed_days)
+    percentage = round((active_days / days_in_month) * 100)
+
+    # Compact calendar that works well inside Telegram.
+    month_calendar = calendar.monthcalendar(year, month)
     lines = [
-        "┌────────────────────────────┐",
-        f"│{header.center(28)}│",
-        "├────────────────────────────┤",
-        "│  Mo  Tu  We  Th  Fr  Sa  Su│",
-        "├────────────────────────────┤"
+        f"     {month_name.upper()}",
+        "Mo Tu We Th Fr Sa Su",
     ]
 
-    for week in cal:
-        row = "│ "
+    for week in month_calendar:
+        cells = []
         for day in week:
             if day == 0:
-                cell = "   "
-            elif day in month_data:
-                cell = f"[{day:02d}]"
-            elif (year < now.year) or (year == now.year and month < now.month) or (year == now.year and month == now.month and day <= now.day):
-                cell = " · "
+                cells.append("  ")
+            elif day in completed_days:
+                cells.append("✓ ")
+            elif (
+                year < now.year
+                or (year == now.year and month < now.month)
+                or (year == now.year and month == now.month and day <= now.day)
+            ):
+                cells.append("· ")
             else:
-                cell = f" {day:02d}"
-            row += cell
-        row += " │"
-        lines.append(row)
+                cells.append(f"{day:02d}"[-2:])
+        lines.append(" ".join(cells))
 
-    lines.append("└────────────────────────────┘")
-    calendar_ascii = "\n".join(lines)
+    calendar_text = "\n".join(lines)
 
-    name = user.first_name or user.username or "Practitioner"
-    msg = (
-        f"📅 *DHYAN CALENDAR*\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🧘 *{esc(name)}* • `{esc(month_name)}`\n\n"
-        f"```text\n{calendar_ascii}\n```\n"
-        f"📊 *Summary:* `{active_days}/{days_in_month} Days` \\({rate}\\%\\) • `{total_minutes} Mins`\n\n"
-        f"Legend: `[05]` Done \\| ` · ` Missed \\| `12` Future"
+    text = (
+        "📅 <b>My Dhyan Calendar</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🧘 {safe_text(display_name(user))}\n\n"
+        f"<pre>{safe_text(calendar_text)}</pre>\n"
+        f"✅ <b>{active_days}</b> of {days_in_month} days completed ({percentage}%)\n"
+        f"⏱ <b>{total_minutes}</b> minutes practiced\n\n"
+        "<b>How to read it:</b> ✓ = practiced  · = missed"
     )
 
-    markup = build_calendar_keyboard(year, month)
+    markup = calendar_keyboard(year, month)
+
     if edit_message and hasattr(update_or_query, "edit_message_text"):
         try:
-            await update_or_query.edit_message_text(text=msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=markup)
+            await update_or_query.edit_message_text(
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
             return
-        except Exception:
-            pass
+        except TelegramError as exc:
+            logger.warning("Could not edit calendar message: %s", exc)
 
-    await send_response(update_or_query, context, msg, reply_markup=markup)
-
-
-async def send_user_stats(update_or_query, context: ContextTypes.DEFAULT_TYPE, user):
-    user_id = user.id
-    today = get_current_date()
-    month = today[:7]
-
-    async with DB_POOL.acquire() as conn:
-        r_month = await conn.fetchrow(
-            "SELECT COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days FROM attendance WHERE user_id = $1 AND attendance_date LIKE $2",
-            user_id, f"{month}%"
-        )
-        r_all = await conn.fetchrow(
-            "SELECT COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days FROM attendance WHERE user_id = $1",
-            user_id
-        )
-        rank_rows = await conn.fetch("""
-            SELECT user_id, COUNT(*) as sessions 
-            FROM attendance WHERE attendance_date LIKE $1 
-            GROUP BY user_id ORDER BY sessions DESC
-        """, f"{month}%")
-        rankings = [r["user_id"] for r in rank_rows]
-
-    month_sits = r_month["sessions"] if r_month else 0
-    month_days = r_month["days"] if r_month else 0
-    all_sits = r_all["sessions"] if r_all else 0
-    all_days = r_all["days"] if r_all else 0
-    user_rank = (rankings.index(user_id) + 1) if user_id in rankings else "—"
-
-    streak = await calculate_streak(user_id)
-    name = user.first_name or user.username or "Practitioner"
-    title = get_title(all_sits)
-
-    card = (
-        f"┌────────────────────────────┐\n"
-        f"│       DHYAN PASSPORT       │\n"
-        f"├────────────────────────────┤\n"
-        f"│  • Active Streak : {streak:>3d} days │\n"
-        f"│  • Monthly Rank  : #{str(user_rank):>3s}     │\n"
-        f"│  • Month Active  : {month_days:>3d} days │\n"
-        f"│  • Total Sits    : {all_sits:>3d} sits │\n"
-        f"└────────────────────────────┘"
-    )
-
-    grid_btn = InlineKeyboardMarkup([[InlineKeyboardButton("📅 View Calendar Grid", callback_data="menu:grid")]])
-    msg = (
-        f"👤 *PRACTITIONER PROFILE*\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🧘 *{esc(name)}* • _{esc(title)}_\n"
-        f"🔥 Streak: *`{esc(streak)} Days`*\n\n"
-        f"```text\n{card}\n```\n"
-        f"✨ Lifetime: `{esc(all_sits)}` sits across `{esc(all_days)}` unique days\\."
-    )
-    await send_response(update_or_query, context, msg, reply_markup=grid_btn)
+    await send_message(update_or_query, context, text, reply_markup=markup)
 
 
-async def send_leaderboard(update_or_query, context: ContextTypes.DEFAULT_TYPE):
-    today = get_current_date()
-    month = today[:7]
+# =========================================================
+# LEADERBOARD
+# =========================================================
+
+async def send_leaderboard(update_or_query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the top practitioners for the current month."""
+    month_prefix = datetime.now(TIMEZONE).strftime("%Y-%m")
     month_name = datetime.now(TIMEZONE).strftime("%B %Y")
 
     async with DB_POOL.acquire() as conn:
-        leaders = await conn.fetch("""
-            SELECT name, COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days
-            FROM attendance WHERE attendance_date LIKE $1 GROUP BY user_id, name ORDER BY sessions DESC, days DESC LIMIT 10
-        """, f"{month}%")
+        leaders = await conn.fetch(
+            """
+            SELECT
+                name,
+                COUNT(*) AS sessions,
+                COUNT(DISTINCT attendance_date) AS days
+            FROM attendance
+            WHERE attendance_date LIKE $1
+            GROUP BY user_id, name
+            ORDER BY sessions DESC, days DESC, name ASC
+            LIMIT 10
+            """,
+            f"{month_prefix}%",
+        )
 
     if not leaders:
-        msg = f"🏆 *LEADERBOARD* • `{esc(month_name)}`\n\n_No practice recorded yet for this month\\._"
-        await send_response(update_or_query, context, msg)
+        text = (
+            "🏆 <b>Leaderboard</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"📅 {safe_text(month_name)}\n\n"
+            "No practice has been recorded this month yet.\n"
+            "Be the first to check in!"
+        )
+        await send_message(update_or_query, context, text, reply_markup=back_to_menu_keyboard())
         return
 
     medals = ["🥇", "🥈", "🥉"]
     rows = []
-    for rank, r in enumerate(leaders, start=1):
-        tag = medals[rank - 1] if rank <= 3 else f"`{rank:02d}.`"
-        rows.append(f"{tag} *{esc(r['name'])}* — `{esc(r['sessions'])} sits` \\({esc(r['days'])}d\\)")
 
-    msg = (
-        f"🏆 *MONTHLY LEADERBOARD*\n"
-        f"📅 `{esc(month_name.upper())}`\n"
-        f"━━━━━━━━━━━━━━━━━━\n\n" + "\n".join(rows)
+    for position, row in enumerate(leaders, start=1):
+        medal = medals[position - 1] if position <= 3 else f"{position}."
+        rows.append(
+            f"{medal} <b>{safe_text(row['name'])}</b> — "
+            f"{row['sessions']} sessions · {row['days']} days"
+        )
+
+    text = (
+        "🏆 <b>Monthly Leaderboard</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📅 {safe_text(month_name)}\n\n"
+        + "\n".join(rows)
+        + "\n\n🌱 Consistency matters more than speed."
     )
-    await send_response(update_or_query, context, msg)
+
+    await send_message(update_or_query, context, text, reply_markup=back_to_menu_keyboard())
 
 
-async def send_group_report(update_or_query, context: ContextTypes.DEFAULT_TYPE):
-    today = get_current_date()
-    month = today[:7]
+# =========================================================
+# COMMUNITY REPORT
+# =========================================================
+
+async def send_group_report(update_or_query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show a simple community summary."""
+    current_date = today_date()
+    month_prefix = current_date[:7]
     month_name = datetime.now(TIMEZONE).strftime("%B %Y")
 
     async with DB_POOL.acquire() as conn:
-        today_sits = await conn.fetchval("SELECT COUNT(*) FROM attendance WHERE attendance_date = $1", today) or 0
-        month_sits = await conn.fetchval("SELECT COUNT(*) FROM attendance WHERE attendance_date LIKE $1", f"{month}%") or 0
-        all_sits = await conn.fetchval("SELECT COUNT(*) FROM attendance") or 0
-        active_members = await conn.fetch("""
-            SELECT name, COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days
-            FROM attendance WHERE attendance_date LIKE $1 GROUP BY user_id, name ORDER BY sessions DESC, days DESC
-        """, f"{month}%")
+        today_sessions = await conn.fetchval(
+            "SELECT COUNT(*) FROM attendance WHERE attendance_date = $1",
+            current_date,
+        ) or 0
 
-    card = (
-        f"┌────────────────────────────┐\n"
-        f"│      COMMUNITY RECAP       │\n"
-        f"├────────────────────────────┤\n"
-        f"│  • Today Check-ins : {today_sits:>4d}  │\n"
-        f"│  • Month Sits      : {month_sits:>4d}  │\n"
-        f"│  • Active Members  : {len(active_members):>4d}  │\n"
-        f"│  • Total Lifetime  : {all_sits:>4d}  │\n"
-        f"└────────────────────────────┘"
+        month_sessions = await conn.fetchval(
+            "SELECT COUNT(*) FROM attendance WHERE attendance_date LIKE $1",
+            f"{month_prefix}%",
+        ) or 0
+
+        lifetime_sessions = await conn.fetchval(
+            "SELECT COUNT(*) FROM attendance"
+        ) or 0
+
+        active_members = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT user_id
+                FROM attendance
+                WHERE attendance_date LIKE $1
+                GROUP BY user_id
+            ) AS members
+            """,
+            f"{month_prefix}%",
+        ) or 0
+
+    text = (
+        "📊 <b>Community Report</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📅 {safe_text(month_name)}\n\n"
+        f"👥 Active members: <b>{active_members}</b>\n"
+        f"✅ Today's check-ins: <b>{today_sessions}</b>\n"
+        f"🧘 This month's sessions: <b>{month_sessions}</b>\n"
+        f"🌱 Lifetime sessions: <b>{lifetime_sessions}</b>\n\n"
+        "Every check-in adds to the community's practice."
     )
 
-    msg = (
-        f"📊 *COMMUNITY REPORT*\n"
-        f"📅 `{esc(month_name.upper())}`\n"
-        f"━━━━━━━━━━━━━━━━━━\n\n"
-        f"```text\n{card}\n```"
-    )
-    await send_response(update_or_query, context, msg)
+    await send_message(update_or_query, context, text, reply_markup=back_to_menu_keyboard())
 
 
 # =========================================================
-# HANDLERS & CALLBACKS
+# ATTENDANCE
 # =========================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today = get_current_date()
-    total = 0
-    if DB_POOL:
-        async with DB_POOL.acquire() as conn:
-            total = await conn.fetchval("SELECT COUNT(*) FROM attendance WHERE attendance_date = $1", today) or 0
-
-    msg = (
-        f"🧘 *DHYAN TRACKER*\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📅 *Date:* `{esc(today)}`\n"
-        f"⏱ *Session:* `20 Minutes`\n\n"
-        f"Check in for today's practice or view records:"
-    )
-    await send_response(update, context, msg, reply_markup=build_menu_keyboard(today, "daily", total))
-
-
-async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today = get_current_date()
-    for new_member in update.message.new_chat_members:
-        if new_member.id != context.bot.id:
-            name = new_member.first_name or "Practitioner"
-            msg = f"🙏 Welcome, *{esc(name)}*\\!\n\nMark your daily 20\\-minute Dhyan sit below:"
-            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=build_menu_keyboard(today, "daily"))
-
-
-async def button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
-
-    if data.startswith("menu:"):
-        await query.answer()
-        action = data.split(":")[1]
-        if action == "mystats":
-            await send_user_stats(query, context, query.from_user)
-        elif action == "grid":
-            await send_visual_grid(query, context, query.from_user)
-        elif action == "leaderboard":
-            await send_leaderboard(query, context)
-        elif action == "report":
-            await send_group_report(query, context)
-        elif action == "main":
-            today = get_current_date()
-            await send_response(query, context, "🎛 *Dhyan Control Center*", reply_markup=build_menu_keyboard(today, "daily"))
+async def record_attendance(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Record one attendance entry."""
+    parts = query.data.split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Something went wrong. Please try again.", show_alert=True)
         return
 
-    if data.startswith("cal:"):
-        await query.answer()
-        _, yr, mo = data.split(":")
-        await send_visual_grid(query, context, query.from_user, int(yr), int(mo), edit_message=True)
-        return
-
-    if not data.startswith("attend:"):
-        await query.answer()
-        return
-
-    parts = data.split(":")
-    attendance_date, session = parts[1], parts[2]
+    _, attendance_date, session = parts
     user = query.from_user
-    name = user.full_name or user.username or "Unknown"
+    name = user.full_name or display_name(user)
 
     async with DB_POOL.acquire() as conn:
         try:
             existing = await conn.fetchval(
-                "SELECT id FROM attendance WHERE user_id = $1 AND attendance_date = $2 AND session = $3",
-                user.id, attendance_date, session
+                """
+                SELECT id
+                FROM attendance
+                WHERE user_id = $1
+                  AND attendance_date = $2
+                  AND session = $3
+                """,
+                user.id,
+                attendance_date,
+                session,
             )
+
             if existing:
-                await query.answer("⚠️ You have already checked in for today!", show_alert=True)
+                await query.answer(
+                    "✅ You have already checked in today.",
+                    show_alert=True,
+                )
                 return
 
             await conn.execute(
-                "INSERT INTO attendance (user_id, name, attendance_date, session, duration_minutes) VALUES ($1, $2, $3, $4, $5)",
-                user.id, name, attendance_date, session, SESSION_MINUTES
+                """
+                INSERT INTO attendance
+                    (user_id, name, attendance_date, session, duration_minutes)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                user.id,
+                name,
+                attendance_date,
+                session,
+                SESSION_MINUTES,
             )
 
-            total = await conn.fetchval("SELECT COUNT(*) FROM attendance WHERE attendance_date = $1 AND session = $2", attendance_date, session)
-            streak = await calculate_streak(user.id)
+            total_today = await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM attendance
+                WHERE attendance_date = $1
+                  AND session = $2
+                """,
+                attendance_date,
+                session,
+            ) or 0
 
-            try:
-                await query.edit_message_reply_markup(reply_markup=build_menu_keyboard(attendance_date, session, total))
-            except Exception:
-                pass
+        except Exception as exc:
+            logger.exception("Attendance insert failed: %s", exc)
+            await query.answer(
+                "⚠️ I could not save your attendance. Please try again.",
+                show_alert=True,
+            )
+            return
 
-            streak_txt = f" 🔥 Streak: {streak} days!" if streak > 1 else ""
-            await query.answer(f"✅ Checked in, {name}!{streak_txt} (Total today: {total})", show_alert=False)
-        except Exception as e:
-            logger.error(f"Error in button_pressed: {e}")
-            await query.answer("⚠️ Failed to record attendance.", show_alert=True)
+    streak = await calculate_streak(user.id)
+    message = f"✅ Check-in saved! Today: {total_today}"
+    if streak > 1:
+        message += f" · 🔥 {streak}-day streak"
 
+    # Keep the button available so the menu remains useful.
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=main_menu_keyboard(attendance_date, session, total_today)
+        )
+    except TelegramError:
+        pass
 
-async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_response(update, context, f"🆔 Chat ID: `{esc(update.effective_chat.id)}`")
+    await query.answer(message, show_alert=False)
 
 
 # =========================================================
-# SCHEDULED PROMPTS (SILENTLY AUTO-PINNED)
+# BUTTONS
 # =========================================================
 
-async def scheduled_prompt(context: ContextTypes.DEFAULT_TYPE):
-    prompt_title, = context.job.data
-    today = get_current_date()
+async def button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle every inline button."""
+    query = update.callback_query
+    await query.answer()
 
-    msg = (
-        f"🧘 *{esc(prompt_title.upper())}*\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📅 Date: `{esc(today)}` • `20 Minutes`\n\n"
-        f"Tap below to mark your practice:"
+    data = query.data or ""
+
+    if data.startswith("attend:"):
+        await record_attendance(query, context)
+        return
+
+    if data.startswith("cal:"):
+        try:
+            _, year, month = data.split(":")
+            await send_calendar(
+                query,
+                context,
+                query.from_user,
+                int(year),
+                int(month),
+                edit_message=True,
+            )
+        except ValueError:
+            await query.answer("Could not open that month.", show_alert=True)
+        return
+
+    if data == "menu:mystats":
+        await send_user_stats(query, context, query.from_user)
+        return
+
+    if data == "menu:grid":
+        await send_calendar(query, context, query.from_user)
+        return
+
+    if data == "menu:leaderboard":
+        await send_leaderboard(query, context)
+        return
+
+    if data == "menu:report":
+        await send_group_report(query, context)
+        return
+
+    if data == "menu:main":
+        current_date = today_date()
+        text = (
+            "🧘 <b>Dhyan Tracker</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "Choose what you would like to see:\n\n"
+            "✅ Check in after your practice\n"
+            "👤 See your personal progress\n"
+            "📅 See your monthly calendar\n"
+            "🏆 See the monthly leaderboard\n"
+            "📊 See the community summary"
+        )
+        await send_message(
+            query,
+            context,
+            text,
+            reply_markup=main_menu_keyboard(current_date, "daily"),
+        )
+        return
+
+
+# =========================================================
+# COMMANDS
+# =========================================================
+
+async def my_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_user_stats(update, context, update.effective_user)
+
+
+async def my_calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_calendar(update, context, update.effective_user)
+
+
+async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_leaderboard(update, context)
+
+
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_group_report(update, context)
+
+
+async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_message(
+        update,
+        context,
+        f"🆔 <b>Chat ID</b>\n<code>{safe_text(update.effective_chat.id)}</code>",
+    )
+
+
+# =========================================================
+# SCHEDULED GROUP MESSAGES
+# =========================================================
+
+async def scheduled_prompt(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a gentle practice reminder and pin it silently."""
+    prompt_title = context.job.data[0]
+    current_date = today_date()
+
+    text = (
+        f"🧘 <b>{safe_text(prompt_title)}</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📅 {safe_text(current_date)}\n"
+        f"⏱ {SESSION_MINUTES} minutes\n\n"
+        "Have you completed your Dhyan practice?\n"
+        "Tap the button below to record it."
     )
 
     sent = await context.bot.send_message(
         chat_id=GROUP_ID,
-        text=msg,
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=build_menu_keyboard(today, "daily", 0),
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard(current_date, "daily"),
     )
 
     try:
-        await context.bot.pin_chat_message(chat_id=GROUP_ID, message_id=sent.message_id, disable_notification=True)
-    except Exception:
-        pass
+        await context.bot.pin_chat_message(
+            chat_id=GROUP_ID,
+            message_id=sent.message_id,
+            disable_notification=True,
+        )
+    except TelegramError:
+        logger.info("Could not pin reminder message.")
 
 
-async def scheduled_catchup(context: ContextTypes.DEFAULT_TYPE):
-    alert_title, = context.job.data
-    today = get_current_date()
-    month = today[:7]
+async def scheduled_catchup(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remind members who have practiced before but have not checked in today."""
+    alert_title = context.job.data[0]
+    current_date = today_date()
+    month_prefix = current_date[:7]
 
     async with DB_POOL.acquire() as conn:
-        unmarked = await conn.fetch("""
-            SELECT DISTINCT user_id, name 
-            FROM attendance 
-            WHERE attendance_date LIKE $1 
+        unmarked = await conn.fetch(
+            """
+            SELECT DISTINCT user_id, name
+            FROM attendance
+            WHERE attendance_date LIKE $1
               AND user_id NOT IN (
-                  SELECT user_id FROM attendance WHERE attendance_date = $2
+                  SELECT user_id
+                  FROM attendance
+                  WHERE attendance_date = $2
               )
-        """, f"{month}%", today)
+            ORDER BY name ASC
+            LIMIT 15
+            """,
+            f"{month_prefix}%",
+            current_date,
+        )
 
     if not unmarked:
         return
 
-    member_lines = "\n".join([f"• {esc(r['name'])}" for r in unmarked[:15]])
-    msg = (
-        f"🔔 *{esc(alert_title.upper())}*\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"Unmarked practitioners today:\n\n"
+    member_lines = "\n".join(
+        f"• {safe_text(row['name'])}" for row in unmarked
+    )
+
+    text = (
+        f"🔔 <b>{safe_text(alert_title)}</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "These members have not checked in today:\n\n"
         f"{member_lines}\n\n"
-        f"Tap below to log your sit:"
+        "If you have completed your practice, tap the button below to record it."
     )
 
     await context.bot.send_message(
         chat_id=GROUP_ID,
-        text=msg,
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=build_menu_keyboard(today, "daily", 0),
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard(current_date, "daily"),
     )
 
 
 # =========================================================
-# LIFECYCLE & WEB SERVER
+# HEALTH CHECK / WEB SERVER
 # =========================================================
 
-async def handle_ping(request):
+async def handle_ping(request: web.Request) -> web.Response:
     return web.Response(text="Dhyan Bot is running 24/7!")
 
 
@@ -538,72 +878,116 @@ async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_ping)
     app.router.add_get("/healthz", handle_ping)
+
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
+
+    port = int(os.environ.get("PORT", "8080"))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"Health server running on port {port}")
+
+    logger.info("Health server running on port %s", port)
     return runner
 
 
-async def post_init(application: Application):
-    await application.bot.set_my_commands([
-        BotCommand("start", "Open Dhyan check-in menu"),
-        BotCommand("my", "My practice stats & streak"),
-        BotCommand("grid", "View monthly calendar"),
-        BotCommand("leaderboard", "Top practitioners"),
-        BotCommand("report", "Community recap"),
-    ])
+# =========================================================
+# BOT COMMANDS
+# =========================================================
+
+async def post_init(application: Application) -> None:
+    await application.bot.set_my_commands(
+        [
+            BotCommand("start", "Open the main menu"),
+            BotCommand("my", "View my stats"),
+            BotCommand("grid", "View my calendar"),
+            BotCommand("leaderboard", "View the leaderboard"),
+            BotCommand("report", "View the community report"),
+            BotCommand("id", "Show chat ID"),
+        ]
+    )
 
 
-async def main():
+# =========================================================
+# START THE BOT
+# =========================================================
+
+async def main() -> None:
     if not TOKEN:
-        logger.error("BOT_TOKEN is not set!")
-        return
+        raise RuntimeError("BOT_TOKEN is not set.")
+
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set.")
 
     await setup_database()
     web_runner = await start_web_server()
 
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    application = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
-    # Scheduled Prompts (IST)
-    prompts = [
-        (time(5, 0, tzinfo=TIMEZONE), ("Morning Dawn Dhyan",)),
-        (time(8, 30, tzinfo=TIMEZONE), ("Mid-Morning Dhyan Call",)),
-        (time(13, 30, tzinfo=TIMEZONE), ("Midday Stillness Pause",)),
-        (time(18, 0, tzinfo=TIMEZONE), ("Evening Sunset Dhyan",)),
+    # -----------------------------------------------------
+    # Regular practice reminders (India time)
+    # -----------------------------------------------------
+    practice_reminders = [
+        (time(5, 0, tzinfo=TIMEZONE), "Morning Dhyan"),
+        (time(8, 30, tzinfo=TIMEZONE), "Mid-Morning Dhyan"),
+        (time(13, 30, tzinfo=TIMEZONE), "Midday Dhyan"),
+        (time(18, 0, tzinfo=TIMEZONE), "Evening Dhyan"),
     ]
-    for schedule_time, data in prompts:
-        app.job_queue.run_daily(scheduled_prompt, schedule_time, data=data)
 
-    catchups = [
-        (time(19, 30, tzinfo=TIMEZONE), ("Evening Dhyan Check",)),
-        (time(21, 30, tzinfo=TIMEZONE), ("Night Attendance Reminder",)),
-        (time(23, 0, tzinfo=TIMEZONE), ("Final Call (11:00 PM)",)),
+    for schedule_time, title in practice_reminders:
+        application.job_queue.run_daily(
+            scheduled_prompt,
+            time=schedule_time,
+            data=(title,),
+        )
+
+    # -----------------------------------------------------
+    # Evening attendance reminders
+    # -----------------------------------------------------
+    catchup_reminders = [
+        (time(19, 30, tzinfo=TIMEZONE), "Evening attendance check"),
+        (time(21, 30, tzinfo=TIMEZONE), "Night attendance reminder"),
+        (time(23, 0, tzinfo=TIMEZONE), "Final attendance reminder"),
     ]
-    for schedule_time, data in catchups:
-        app.job_queue.run_daily(scheduled_catchup, schedule_time, data=data)
 
-    # Handlers
-    app.add_handler(CommandHandler(["start", "menu", "attendance"], start))
-    app.add_handler(CommandHandler(["grid", "mygrid"], lambda u, c: send_visual_grid(u, c, u.effective_user) if u.effective_user else None))
-    app.add_handler(CommandHandler("leaderboard", send_leaderboard))
-    app.add_handler(CommandHandler("report", send_group_report))
-    app.add_handler(CommandHandler("id", show_id))
-    app.add_handler(CommandHandler(["my", "myattendance", "mystats", "status"], lambda u, c: send_user_stats(u, c, u.effective_user) if u.effective_user else None))
-    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^(/my|/myattendance|/mystats|/status|/grid|/mygrid|my grid|my stats|my attendance)"), lambda u, c: send_user_stats(u, c, u.effective_user) if u.effective_user else None))
-    app.add_handler(CallbackQueryHandler(button_pressed))
+    for schedule_time, title in catchup_reminders:
+        application.job_queue.run_daily(
+            scheduled_catchup,
+            time=schedule_time,
+            data=(title,),
+        )
+
+    # -----------------------------------------------------
+    # Commands
+    # -----------------------------------------------------
+    application.add_handler(CommandHandler(["start", "menu", "attendance"], start))
+    application.add_handler(CommandHandler(["my", "myattendance", "mystats", "status"], my_stats_command))
+    application.add_handler(CommandHandler(["grid", "mygrid"], my_calendar_command))
+    application.add_handler(CommandHandler("leaderboard", leaderboard_command))
+    application.add_handler(CommandHandler("report", report_command))
+    application.add_handler(CommandHandler("id", show_id))
+
+    # New members + inline buttons
+    application.add_handler(
+        MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member)
+    )
+    application.add_handler(CallbackQueryHandler(button_pressed))
 
     try:
-        async with app:
-            await app.start()
-            await app.bot.delete_webhook(drop_pending_updates=True)
-            await app.updater.start_polling(drop_pending_updates=True)
-            logger.info("Dhyan Bot running smoothly.")
+        async with application:
+            await application.start()
+            await application.bot.delete_webhook(drop_pending_updates=True)
+            await application.updater.start_polling(drop_pending_updates=True)
+
+            logger.info("Dhyan Bot is running.")
+
             while True:
                 await asyncio.sleep(3600)
+
     finally:
         if DB_POOL:
             await DB_POOL.close()

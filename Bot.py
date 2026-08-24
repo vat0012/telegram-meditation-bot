@@ -1,16 +1,15 @@
 import asyncio
 import calendar
-from datetime import datetime, timedelta, time
+from datetime import datetime, time, timedelta
 import logging
 import os
-import sqlite3
 from zoneinfo import ZoneInfo
 
+import aiosqlite
 from aiohttp import web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.helpers import escape_markdown
-from telegram.error import RetryAfter
+from telegram.error import RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -19,11 +18,12 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.helpers import escape_markdown
 
 # Logging configuration
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
@@ -31,8 +31,8 @@ logger = logging.getLogger(__name__)
 # BOT CONFIGURATION
 # =========================================================
 
-TOKEN = os.getenv("BOT_TOKEN", "8046423951:AAGgQI2FMeXBT3tyTLIFDym3tqnevaopbQ8")
-GROUP_ID = int(os.getenv("GROUP_ID", "-4721378655"))
+TOKEN = os.getenv("BOT_TOKEN", "")
+GROUP_ID = int(os.getenv("GROUP_ID", "-1001234567890"))
 DB_NAME = "attendance.db"
 TIMEZONE = ZoneInfo("Asia/Kolkata")
 SESSION_MINUTES = 20
@@ -42,59 +42,54 @@ def get_current_date() -> str:
     return datetime.now(TIMEZONE).date().isoformat()
 
 
-def esc(text: str) -> str:
+def esc(text: object) -> str:
     return escape_markdown(str(text), version=2)
 
 
 def get_zen_title(total_sessions: int) -> str:
     if total_sessions >= 150:
         return "Master of Stillness 🏔️"
-    elif total_sessions >= 75:
+    if total_sessions >= 75:
         return "Zen Practitioner 🌿"
-    elif total_sessions >= 30:
+    if total_sessions >= 30:
         return "Mindful Seeker 🌊"
-    elif total_sessions >= 10:
+    if total_sessions >= 10:
         return "Consistent Meditator 🌱"
     return "Mindful Beginner ✨"
 
 
 # =========================================================
-# DATABASE OPERATIONS
+# DATABASE OPERATIONS (ASYNC)
 # =========================================================
 
-def setup_database():
-    connection = sqlite3.connect(DB_NAME)
-    cursor = connection.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS attendance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            name TEXT NOT NULL,
-            attendance_date TEXT NOT NULL,
-            session TEXT NOT NULL,
-            duration_minutes INTEGER DEFAULT 20,
-            UNIQUE(user_id, attendance_date, session)
-        )
-    """)
-    try:
-        cursor.execute("ALTER TABLE attendance ADD COLUMN duration_minutes INTEGER DEFAULT 20")
-    except sqlite3.OperationalError:
-        pass
-    connection.commit()
-    connection.close()
+async def setup_database():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS attendance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                attendance_date TEXT NOT NULL,
+                session TEXT NOT NULL,
+                duration_minutes INTEGER DEFAULT 20,
+                UNIQUE(user_id, attendance_date, session)
+            )
+        """)
+        # Create indexes for instant queries as database grows
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_user_date ON attendance(user_id, attendance_date)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_date_session ON attendance(attendance_date, session)")
+        await db.commit()
 
 
-def calculate_streak(user_id: int) -> int:
-    connection = sqlite3.connect(DB_NAME)
-    cursor = connection.cursor()
-    cursor.execute("""
-        SELECT DISTINCT attendance_date 
-        FROM attendance 
-        WHERE user_id = ? 
-        ORDER BY attendance_date DESC
-    """, (user_id,))
-    rows = cursor.fetchall()
-    connection.close()
+async def calculate_streak(user_id: int) -> int:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("""
+            SELECT DISTINCT attendance_date 
+            FROM attendance 
+            WHERE user_id = ? 
+            ORDER BY attendance_date DESC
+        """, (user_id,)) as cursor:
+            rows = await cursor.fetchall()
 
     if not rows:
         return 0
@@ -153,7 +148,7 @@ async def send_response(update_or_query, context: ContextTypes.DEFAULT_TYPE, tex
         else:
             chat_id = update_or_query.message.chat_id if update_or_query.message else update_or_query.from_user.id
             await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=reply_markup)
-    except Exception as e:
+    except TelegramError as e:
         logger.error(f"Error sending message: {e}")
 
 
@@ -166,14 +161,13 @@ async def send_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, 
     month_prefix = today.isoformat()[:7]
     month_name = today.strftime("%B %Y")
 
-    connection = sqlite3.connect(DB_NAME)
-    cursor = connection.cursor()
-    cursor.execute(
-        "SELECT DISTINCT attendance_date FROM attendance WHERE user_id = ? AND attendance_date LIKE ?",
-        (user.id, f"{month_prefix}%")
-    )
-    attended_days = {datetime.strptime(r[0], "%Y-%m-%d").date().day for r in cursor.fetchall()}
-    connection.close()
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT DISTINCT attendance_date FROM attendance WHERE user_id = ? AND attendance_date LIKE ?",
+            (user.id, f"{month_prefix}%")
+        ) as cursor:
+            rows = await cursor.fetchall()
+            attended_days = {datetime.strptime(r[0], "%Y-%m-%d").date().day for r in rows}
 
     cal = calendar.monthcalendar(today.year, today.month)
     lines = [
@@ -219,24 +213,28 @@ async def send_user_stats(update_or_query, context: ContextTypes.DEFAULT_TYPE, u
     today = get_current_date()
     month = today[:7]
 
-    connection = sqlite3.connect(DB_NAME)
-    cursor = connection.cursor()
-    cursor.execute("SELECT COUNT(*), COUNT(DISTINCT attendance_date) FROM attendance WHERE user_id = ? AND attendance_date LIKE ?", (user_id, f"{month}%"))
-    month_sessions, month_days = cursor.fetchone()
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT attendance_date) FROM attendance WHERE user_id = ? AND attendance_date LIKE ?",
+            (user_id, f"{month}%")
+        ) as cursor:
+            month_sessions, month_days = await cursor.fetchone()
 
-    cursor.execute("SELECT COUNT(*), COUNT(DISTINCT attendance_date) FROM attendance WHERE user_id = ?", (user_id,))
-    all_time_sessions, all_time_days = cursor.fetchone()
+        async with db.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT attendance_date) FROM attendance WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            all_time_sessions, all_time_days = await cursor.fetchone()
 
-    cursor.execute("""
-        SELECT user_id, COUNT(*) as sessions 
-        FROM attendance WHERE attendance_date LIKE ? 
-        GROUP BY user_id ORDER BY sessions DESC
-    """, (f"{month}%",))
-    rankings = [row[0] for row in cursor.fetchall()]
+        async with db.execute("""
+            SELECT user_id, COUNT(*) as sessions 
+            FROM attendance WHERE attendance_date LIKE ? 
+            GROUP BY user_id ORDER BY sessions DESC
+        """, (f"{month}%",)) as cursor:
+            rankings = [row[0] for row in await cursor.fetchall()]
+
     user_rank = (rankings.index(user_id) + 1) if user_id in rankings else "—"
-    connection.close()
-
-    streak = calculate_streak(user_id)
+    streak = await calculate_streak(user_id)
     name = user.first_name or user.username or "Practitioner"
     title = get_zen_title(all_time_sessions)
 
@@ -276,14 +274,12 @@ async def send_leaderboard(update_or_query, context: ContextTypes.DEFAULT_TYPE):
     month = today[:7]
     month_name = datetime.now(TIMEZONE).strftime("%B %Y")
 
-    connection = sqlite3.connect(DB_NAME)
-    cursor = connection.cursor()
-    cursor.execute("""
-        SELECT name, COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days
-        FROM attendance WHERE attendance_date LIKE ? GROUP BY user_id ORDER BY sessions DESC, days DESC LIMIT 10
-    """, (f"{month}%",))
-    leaders = cursor.fetchall()
-    connection.close()
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("""
+            SELECT name, COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days
+            FROM attendance WHERE attendance_date LIKE ? GROUP BY user_id ORDER BY sessions DESC, days DESC LIMIT 10
+        """, (f"{month}%",)) as cursor:
+            leaders = await cursor.fetchall()
 
     if not leaders:
         msg = f"🏆 *SANGHA LEADERBOARD*\n📅 *Month:* `{esc(month_name.upper())}`\n\n_No practice records found yet for this month\\._"
@@ -302,10 +298,10 @@ async def send_leaderboard(update_or_query, context: ContextTypes.DEFAULT_TYPE):
         f"┌──────────────────────────────┐\n"
         f"│      🏆 MONTHLY PODIUM       │\n"
         f"├──────────────────────────────┤\n"
-        f"│             🥇 1st           │\n"
+        f"│            🥇 1st            │\n"
         f"│          {p1_fmt.center(12)}        │\n"
         f"│                              │\n"
-        f"│     🥈 2nd          🥉 3rd   │\n"
+        f"│    🥈 2nd          🥉 3rd   │\n"
         f"│   {p2_fmt.center(10)}      {p3_fmt.center(10)} │\n"
         f"└──────────────────────────────┘"
     )
@@ -327,27 +323,25 @@ async def send_leaderboard(update_or_query, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_group_report(update_or_query, context: ContextTypes.DEFAULT_TYPE):
-    connection = sqlite3.connect(DB_NAME)
-    cursor = connection.cursor()
     today = get_current_date()
     month = today[:7]
     month_name = datetime.now(TIMEZONE).strftime("%B %Y")
 
-    cursor.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date = ?", (today,))
-    today_sessions = cursor.fetchone()[0]
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date = ?", (today,)) as cursor:
+            today_sessions = (await cursor.fetchone())[0]
 
-    cursor.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date LIKE ?", (f"{month}%",))
-    month_sessions = cursor.fetchone()[0]
+        async with db.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date LIKE ?", (f"{month}%",)) as cursor:
+            month_sessions = (await cursor.fetchone())[0]
 
-    cursor.execute("SELECT COUNT(*) FROM attendance")
-    all_time_sessions = cursor.fetchone()[0]
+        async with db.execute("SELECT COUNT(*) FROM attendance") as cursor:
+            all_time_sessions = (await cursor.fetchone())[0]
 
-    cursor.execute("""
-        SELECT name, COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days
-        FROM attendance WHERE attendance_date LIKE ? GROUP BY user_id ORDER BY sessions DESC, days DESC
-    """, (f"{month}%",))
-    active_members = cursor.fetchall()
-    connection.close()
+        async with db.execute("""
+            SELECT name, COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days
+            FROM attendance WHERE attendance_date LIKE ? GROUP BY user_id ORDER BY sessions DESC, days DESC
+        """, (f"{month}%",)) as cursor:
+            active_members = await cursor.fetchall()
 
     summary_card = (
         f"┌──────────────────────────────┐\n"
@@ -382,15 +376,15 @@ async def send_group_report(update_or_query, context: ContextTypes.DEFAULT_TYPE)
 
 
 # =========================================================
-# AESTHETIC CLOCK & TIMER
+# AESTHETIC CLOCK & RATE-LIMITED TIMER
 # =========================================================
 
 def get_mindful_phase(percent: int) -> str:
     if percent < 20:
         return "🌱 Settling the Breath"
-    elif percent < 50:
+    if percent < 50:
         return "🌊 Entering Stillness"
-    elif percent < 85:
+    if percent < 85:
         return "🏔️ Deep Awareness"
     return "✨ Gentle Integration"
 
@@ -428,61 +422,65 @@ def render_clock_canvas(name: str, mins: int, secs: int, percent: int) -> str:
 
 async def run_live_timer(chat_id: int, user, session: str, context: ContextTypes.DEFAULT_TYPE):
     total_seconds = SESSION_MINUTES * 60
-    update_interval = 5
+    # Update every 60 seconds to prevent Telegram 429 Flood Wait rate limits
+    update_interval = 60
     user_display = user.first_name or user.username or "Practitioner"
 
     msg = await context.bot.send_message(
         chat_id=chat_id,
-        text=render_clock_canvas(user_display, 20, 0, 0),
-        parse_mode=ParseMode.MARKDOWN_V2
+        text=render_clock_canvas(user_display, SESSION_MINUTES, 0, 0),
+        parse_mode=ParseMode.MARKDOWN_V2,
     )
 
-    for remaining in range(total_seconds - update_interval, -1, -update_interval):
+    remaining = total_seconds
+    while remaining > 0:
         await asyncio.sleep(update_interval)
-        mins, secs = divmod(remaining, 60)
+        remaining -= update_interval
+        mins, secs = divmod(max(remaining, 0), 60)
         percent = int(((total_seconds - remaining) / total_seconds) * 100)
 
         if remaining > 0:
             try:
-                await msg.edit_text(text=render_clock_canvas(user_display, mins, secs, percent), parse_mode=ParseMode.MARKDOWN_V2)
+                await msg.edit_text(
+                    text=render_clock_canvas(user_display, mins, secs, percent),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                )
             except RetryAfter as e:
                 await asyncio.sleep(e.retry_after)
             except Exception:
                 pass
-        else:
-            today = get_current_date()
-            name = user.full_name or user.username or "Unknown"
-            connection = sqlite3.connect(DB_NAME)
-            cursor = connection.cursor()
-            try:
-                cursor.execute(
-                    "INSERT INTO attendance (user_id, name, attendance_date, session, duration_minutes) VALUES (?, ?, ?, ?, ?)",
-                    (user.id, name, today, session, SESSION_MINUTES)
-                )
-                connection.commit()
-            except sqlite3.IntegrityError:
-                pass
-            finally:
-                connection.close()
 
-            streak = calculate_streak(user.id)
-            streak_line = f"🔥 *Active Practice Streak:* `{streak} days`\n" if streak > 1 else ""
-            completion_canvas = (
-                f"┌──────────────────────────────┐\n"
-                f"│      🔔 SESSION COMPLETE     │\n"
-                f"├──────────────────────────────┤\n"
-                f"│                              │\n"
-                f"│           20 : 00            │\n"
-                f"│                              │\n"
-                f"│   [━━━━━━━━━━━━━━━━━━━━]   │\n"
-                f"│                              │\n"
-                f"│      Mindful Sit : 100%      │\n"
-                f"└──────────────────────────────┘"
+    today = get_current_date()
+    name = user.full_name or user.username or "Unknown"
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        try:
+            await db.execute(
+                "INSERT INTO attendance (user_id, name, attendance_date, session, duration_minutes) VALUES (?, ?, ?, ?, ?)",
+                (user.id, name, today, session, SESSION_MINUTES),
             )
-            await msg.edit_text(
-                text=f"🕊 *PEACEFUL PRACTICE CONCLUDED*\n\n```text\n{completion_canvas}\n```\n✨ Deep gratitude, *{esc(user_display)}*\\.\n✅ Today's session logged\\.\n{streak_line}",
-                parse_mode=ParseMode.MARKDOWN_V2
-            )
+            await db.commit()
+        except aiosqlite.IntegrityError:
+            pass
+
+    streak = await calculate_streak(user.id)
+    streak_line = f"🔥 *Active Practice Streak:* `{streak} days`\n" if streak > 1 else ""
+    completion_canvas = (
+        f"┌──────────────────────────────┐\n"
+        f"│      🔔 SESSION COMPLETE     │\n"
+        f"├──────────────────────────────┤\n"
+        f"│                              │\n"
+        f"│           20 : 00            │\n"
+        f"│                              │\n"
+        f"│   [━━━━━━━━━━━━━━━━━━━━]   │\n"
+        f"│                              │\n"
+        f"│      Mindful Sit : 100%      │\n"
+        f"└──────────────────────────────┘"
+    )
+    await msg.edit_text(
+        text=f"🕊 *PEACEFUL PRACTICE CONCLUDED*\n\n```text\n{completion_canvas}\n```\n✨ Deep gratitude, *{esc(user_display)}*\\.\n✅ Today's session logged\\.\n{streak_line}",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
 
 
 # =========================================================
@@ -550,30 +548,30 @@ async def button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = query.from_user
     name = user.full_name or user.username or "Unknown"
 
-    connection = sqlite3.connect(DB_NAME)
-    cursor = connection.cursor()
-    try:
-        cursor.execute(
-            "INSERT INTO attendance (user_id, name, attendance_date, session, duration_minutes) VALUES (?, ?, ?, ?, ?)",
-            (user.id, name, attendance_date, session, SESSION_MINUTES)
-        )
-        connection.commit()
-        cursor.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date = ? AND session = ?", (attendance_date, session))
-        total = cursor.fetchone()[0]
-        streak = calculate_streak(user.id)
+    async with aiosqlite.connect(DB_NAME) as db:
         try:
-            await query.edit_message_reply_markup(reply_markup=build_attendance_keyboard(attendance_date, session, total))
-        except Exception:
-            pass
-        streak_text = f" 🔥 Streak: {streak} days!" if streak > 1 else ""
-        await query.answer(f"✅ Session logged, {name}!{streak_text} (Total today: {total})", show_alert=False)
-    except sqlite3.IntegrityError:
-        await query.answer("⚠️ You have already checked in for today's practice!", show_alert=True)
-    except Exception as e:
-        logger.error(f"Error in button_pressed: {e}")
-        await query.answer("⚠️ Failed to record attendance.", show_alert=True)
-    finally:
-        connection.close()
+            await db.execute(
+                "INSERT INTO attendance (user_id, name, attendance_date, session, duration_minutes) VALUES (?, ?, ?, ?, ?)",
+                (user.id, name, attendance_date, session, SESSION_MINUTES),
+            )
+            await db.commit()
+
+            async with db.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date = ? AND session = ?", (attendance_date, session)) as cursor:
+                total = (await cursor.fetchone())[0]
+
+            streak = await calculate_streak(user.id)
+            try:
+                await query.edit_message_reply_markup(reply_markup=build_attendance_keyboard(attendance_date, session, total))
+            except Exception:
+                pass
+
+            streak_text = f" 🔥 Streak: {streak} days!" if streak > 1 else ""
+            await query.answer(f"✅ Session logged, {name}!{streak_text} (Total today: {total})", show_alert=False)
+        except aiosqlite.IntegrityError:
+            await query.answer("⚠️ You have already checked in for today's practice!", show_alert=True)
+        except Exception as e:
+            logger.error(f"Error in button_pressed: {e}")
+            await query.answer("⚠️ Failed to record attendance.", show_alert=True)
 
 
 async def my_attendance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -599,11 +597,10 @@ async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# REUSABLE SCHEDULED REMINDER ROUTINES
+# REUSABLE SCHEDULED REMINDERS
 # =========================================================
 
 async def scheduled_community_prompt(context: ContextTypes.DEFAULT_TYPE):
-    """Broadcasts daily practice invites across different phases of the day."""
     prompt_title, greeting = context.job.data
     today = get_current_date()
 
@@ -620,30 +617,26 @@ async def scheduled_community_prompt(context: ContextTypes.DEFAULT_TYPE):
         chat_id=GROUP_ID,
         text=msg,
         parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=build_attendance_keyboard(today, "daily", 0)
+        reply_markup=build_attendance_keyboard(today, "daily", 0),
     )
 
 
 async def scheduled_unmarked_catchup(context: ContextTypes.DEFAULT_TYPE):
-    """Scans for active monthly members who have not marked today's practice."""
     alert_title, custom_note = context.job.data
     today = get_current_date()
     month = today[:7]
 
-    connection = sqlite3.connect(DB_NAME)
-    cursor = connection.cursor()
-    cursor.execute("""
-        SELECT DISTINCT user_id, name 
-        FROM attendance 
-        WHERE attendance_date LIKE ? 
-          AND user_id NOT IN (
-              SELECT user_id FROM attendance WHERE attendance_date = ?
-          )
-    """, (f"{month}%", today))
-    unmarked_members = cursor.fetchall()
-    connection.close()
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("""
+            SELECT DISTINCT user_id, name 
+            FROM attendance 
+            WHERE attendance_date LIKE ? 
+              AND user_id NOT IN (
+                  SELECT user_id FROM attendance WHERE attendance_date = ?
+              )
+        """, (f"{month}%", today)) as cursor:
+            unmarked_members = await cursor.fetchall()
 
-    # If everyone is done, stay silent
     if not unmarked_members:
         return
 
@@ -662,19 +655,19 @@ async def scheduled_unmarked_catchup(context: ContextTypes.DEFAULT_TYPE):
         chat_id=GROUP_ID,
         text=msg,
         parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=build_attendance_keyboard(today, "daily", 0)
+        reply_markup=build_attendance_keyboard(today, "daily", 0),
     )
 
 
 # =========================================================
-# RENDER KEEP-ALIVE SERVER
+# WEB SERVER & APP LIFECYCLE
 # =========================================================
 
 async def handle_ping(request):
     return web.Response(text="Bot is running smoothly 24/7!")
 
 
-async def run_web_server():
+async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_ping)
     app.router.add_get("/healthz", handle_ping)
@@ -684,83 +677,42 @@ async def run_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logger.info(f"Health check web server running on port {port}")
+    return runner
 
-
-# =========================================================
-# MAIN ENTRYPOINT
-# =========================================================
 
 async def main():
-    setup_database()
-    await run_web_server()
+    if not TOKEN:
+        logger.error("BOT_TOKEN environment variable not set!")
+        return
+
+    await setup_database()
+    web_runner = await start_web_server()
 
     app = Application.builder().token(TOKEN).build()
 
-    # -----------------------------------------------------
-    # 4 COMMUNITY PRACTICE PROMPTS
-    # -----------------------------------------------------
-    
-    # 1. 05:00 AM IST - Dawn / Brahma Muhurta
-    app.job_queue.run_daily(
-        scheduled_community_prompt,
-        time(hour=5, minute=0, tzinfo=TIMEZONE),
-        data=("Morning Dawn Meditation", "Good morning! Welcome the dawn with peaceful awareness.")
-    )
+    # Scheduled Jobs
+    prompts = [
+        (time(5, 0, tzinfo=TIMEZONE), ("Morning Dawn Meditation", "Good morning! Welcome the dawn with peaceful awareness.")),
+        (time(8, 30, tzinfo=TIMEZONE), ("Mid-Morning Practice Call", "Ground your thoughts and center your presence before the workday accelerates.")),
+        (time(13, 30, tzinfo=TIMEZONE), ("Midday Stillness Pause", "Step back for 20 minutes of calm breath to reset your mental clarity.")),
+        (time(18, 0, tzinfo=TIMEZONE), ("Evening Sunset Meditation", "Unwind from daily activity and transition into restful evening stillness.")),
+    ]
+    for schedule_time, data in prompts:
+        app.job_queue.run_daily(scheduled_community_prompt, schedule_time, data=data)
 
-    # 2. 08:30 AM IST - Mid-Morning Grounding
-    app.job_queue.run_daily(
-        scheduled_community_prompt,
-        time(hour=8, minute=30, tzinfo=TIMEZONE),
-        data=("Mid-Morning Practice Call", "Ground your thoughts and center your presence before the workday accelerates.")
-    )
+    catchups = [
+        (time(19, 30, tzinfo=TIMEZONE), ("Evening Practice Check", "A gentle reminder to find 20 minutes of peace this evening.")),
+        (time(21, 30, tzinfo=TIMEZONE), ("Night Attendance Reminder", "Wind down your day with mindful meditation before sleep.")),
+        (time(23, 0, tzinfo=TIMEZONE), ("Final Daily Call (11:00 PM)", "Protect your daily practice streak before midnight!")),
+    ]
+    for schedule_time, data in catchups:
+        app.job_queue.run_daily(scheduled_unmarked_catchup, schedule_time, data=data)
 
-    # 3. 01:30 PM IST - Midday Pause & Breath
-    app.job_queue.run_daily(
-        scheduled_community_prompt,
-        time(hour=13, minute=30, tzinfo=TIMEZONE),
-        data=("Midday Stillness Pause", "Step back for 20 minutes of calm breath to reset your mental clarity.")
-    )
-
-    # 4. 06:00 PM IST - Sunset / Evening Sit
-    app.job_queue.run_daily(
-        scheduled_community_prompt,
-        time(hour=18, minute=0, tzinfo=TIMEZONE),
-        data=("Evening Sunset Meditation", "Unwind from daily activity and transition into restful evening stillness.")
-    )
-
-    # -----------------------------------------------------
-    # 3 UNMARKED CATCH-UP REMINDERS
-    # -----------------------------------------------------
-
-    # 5. 07:30 PM IST - Early Evening Catch-Up
-    app.job_queue.run_daily(
-        scheduled_unmarked_catchup,
-        time(hour=19, minute=30, tzinfo=TIMEZONE),
-        data=("Evening Practice Check", "A gentle reminder to find 20 minutes of peace this evening.")
-    )
-
-    # 6. 09:30 PM IST - Late Evening Nudge
-    app.job_queue.run_daily(
-        scheduled_unmarked_catchup,
-        time(hour=21, minute=30, tzinfo=TIMEZONE),
-        data=("Night Attendance Reminder", "Wind down your day with mindful meditation before sleep.")
-    )
-
-    # 7. 11:00 PM IST - Final Call (Streak Protection)
-    app.job_queue.run_daily(
-        scheduled_unmarked_catchup,
-        time(hour=23, minute=0, tzinfo=TIMEZONE),
-        data=("Final Daily Call (11:00 PM)", "Protect your daily practice streak before the day turns over at midnight!")
-    )
-
-    # -----------------------------------------------------
-    # HANDLERS
-    # -----------------------------------------------------
+    # Command & Message Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("attendance", attendance_prompt))
-    app.add_handler(CommandHandler("grid", grid_cmd))
-    app.add_handler(CommandHandler("mygrid", grid_cmd))
+    app.add_handler(CommandHandler(["grid", "mygrid"], grid_cmd))
     app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("id", show_id))
@@ -768,13 +720,15 @@ async def main():
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^(/my|/myattendance|/mystats|/status|/grid|/mygrid|my grid|my stats|my attendance)"), my_attendance_cmd))
     app.add_handler(CallbackQueryHandler(button_pressed))
 
-    logger.info("Bot started with 4 community prompts & 3 catch-up reminders...")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-
-    while True:
-        await asyncio.sleep(3600)
+    try:
+        async with app:
+            await app.start()
+            await app.updater.start_polling(drop_pending_updates=True)
+            logger.info("Bot started successfully.")
+            while True:
+                await asyncio.sleep(3600)
+    finally:
+        await web_runner.cleanup()
 
 
 if __name__ == "__main__":

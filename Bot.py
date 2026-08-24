@@ -437,16 +437,6 @@ async def send_group_report(update_or_query, context: ContextTypes.DEFAULT_TYPE)
 # AESTHETIC CLOCK & TIMER
 # =========================================================
 
-def get_mindful_phase(percent: int) -> str:
-    if percent < 20:
-        return "🌱 Settling the Breath"
-    if percent < 50:
-        return "🌊 Entering Stillness"
-    if percent < 85:
-        return "🏔️ Deep Awareness"
-    return "✨ Gentle Integration"
-
-
 def render_clock_canvas(name: str, mins: int, secs: int, percent: int) -> str:
     bar_width = 20
     filled_units = int((percent / 100) * bar_width)
@@ -457,7 +447,6 @@ def render_clock_canvas(name: str, mins: int, secs: int, percent: int) -> str:
     else:
         bar = "━" * (filled_units - 1) + "╾" + "─" * (bar_width - filled_units)
 
-    phase = get_mindful_phase(percent)
     canvas = (
         f"┌──────────────────────────────┐\n"
         f"│      🧘 MEDITATION SANGHA    │\n"
@@ -472,14 +461,13 @@ def render_clock_canvas(name: str, mins: int, secs: int, percent: int) -> str:
     )
     return (
         f"🕯 *{esc(name.upper())}'S PRACTICE ROOM*\n\n"
-        f"```text\n{canvas}\n```\n"
-        f"🕊 *State:* _{esc(phase)}_"
+        f"```text\n{canvas}\n```"
     )
 
 
 async def run_live_timer(chat_id: int, user, session: str, context: ContextTypes.DEFAULT_TYPE):
     total_seconds = SESSION_MINUTES * 60
-    update_interval = 60
+    update_interval = 5
     user_display = user.first_name or user.username or "Practitioner"
 
     msg = await context.bot.send_message(

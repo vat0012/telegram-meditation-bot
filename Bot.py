@@ -31,8 +31,9 @@ logger = logging.getLogger(__name__)
 # BOT CONFIGURATION
 # =========================================================
 
-TOKEN = os.getenv("8046423951:AAGgQI2FMeXBT3tyTLIFDym3tqnevaopbQ8", "")
-GROUP_ID = int(os.getenv("GROUP_ID", "-1001234567890"))
+# Put your token in the BOT_TOKEN environment variable, or paste it as fallback
+TOKEN = os.getenv("BOT_TOKEN", "8046423951:AAGgQI2FMeXBT3tyTLIFDym3tqnevaopbQ8")
+GROUP_ID = int(os.getenv("GROUP_ID", "-4721378655"))
 DB_NAME = "attendance.db"
 TIMEZONE = ZoneInfo("Asia/Kolkata")
 SESSION_MINUTES = 20
@@ -75,7 +76,6 @@ async def setup_database():
                 UNIQUE(user_id, attendance_date, session)
             )
         """)
-        # Create indexes for instant queries as database grows
         await db.execute("CREATE INDEX IF NOT EXISTS idx_user_date ON attendance(user_id, attendance_date)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_date_session ON attendance(attendance_date, session)")
         await db.commit()
@@ -141,6 +141,22 @@ def build_main_menu_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def build_month_grid_keyboard(year: int, month: int) -> InlineKeyboardMarkup:
+    prev_month = month - 1 if month > 1 else 12
+    prev_year = year if month > 1 else year - 1
+
+    next_month = month + 1 if month < 12 else 1
+    next_year = year if month < 12 else year + 1
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("◀️ Prev Month", callback_data=f"cal:{prev_year}:{prev_month:02d}"),
+            InlineKeyboardButton("Next Month ▶️", callback_data=f"cal:{next_year}:{next_month:02d}"),
+        ],
+        [InlineKeyboardButton("🔙 Main Menu", callback_data="menu:main")]
+    ])
+
+
 async def send_response(update_or_query, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
     try:
         if isinstance(update_or_query, Update) and update_or_query.message:
@@ -167,7 +183,6 @@ async def send_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, 
     days_in_month = calendar.monthrange(year, month)[1]
 
     async with aiosqlite.connect(DB_NAME) as db:
-        # Fetch every session recorded for the entire month
         async with db.execute(
             """
             SELECT attendance_date, session, duration_minutes 
@@ -179,7 +194,6 @@ async def send_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, 
         ) as cursor:
             records = await cursor.fetchall()
 
-    # Map records by date: day_number -> list of sessions
     month_data = {}
     total_minutes = 0
     total_sessions = len(records)
@@ -194,7 +208,6 @@ async def send_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, 
     attended_days_count = len(month_data)
     completion_rate = int((attended_days_count / days_in_month) * 100)
 
-    # 1. ASCII Grid Generation (Shows All Days)
     cal = calendar.monthcalendar(year, month)
     lines = [
         "╔═════════════════════════════╗",
@@ -210,13 +223,10 @@ async def send_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, 
             if day == 0:
                 cell = "    "
             elif day in month_data:
-                # [XX] = Completed
                 cell = f"[{day:02d}]"
             elif (year < now.year) or (year == now.year and month < now.month) or (year == now.year and month == now.month and day <= now.day):
-                # · = Missed past day
                 cell = "  · "
             else:
-                # Upcoming future day
                 cell = f"  {day:02d}"
             row_str += cell
         row_str += " ║"
@@ -225,14 +235,12 @@ async def send_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, 
     lines.append("╚═════════════════════════════╝")
     calendar_ascii = "\n".join(lines)
 
-    # 2. Detailed Month Log / Timeline
     log_lines = []
     if month_data:
         for day in sorted(month_data.keys()):
-            sessions_done = month_data[day]
-            count = len(sessions_done)
-            count_label = f"({count} sits)" if count > 1 else ""
-            log_lines.append(f"`{day:02d} {month_dt.strftime('%b')}` ✅ Completed {count_label}")
+            count = len(month_data[day])
+            count_label = f" \\({esc(count)} sits\\)" if count > 1 else ""
+            log_lines.append(f"• `{day:02d} {esc(month_dt.strftime('%b'))}` ✅ Completed{count_label}")
         full_log_text = "\n".join(log_lines)
     else:
         full_log_text = "_No sessions recorded for this month\\._"
@@ -246,8 +254,8 @@ async def send_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, 
         f"📆 Month: *{esc(month_name)}*\n\n"
         f"```text\n{calendar_ascii}\n```\n"
         f"📊 *Month Summary:*\n"
-        f" └ Days Active: `{esc(attended_days_count)} / {days_in_month}` \\({esc(completion_rate)}%\\)\n"
-        f" └ Total Sits: `{esc(total_sessions)}` \\| Practice Time: `{esc(total_minutes)} mins`\n\n"
+        f" └ Active Days: `{esc(attended_days_count)} / {days_in_month}` \\({esc(completion_rate)}\\%\\)\n"
+        f" └ Total Sits: `{esc(total_sessions)}` \\| Time: `{esc(total_minutes)} mins`\n\n"
         f"📋 *Daily Practice Ledger:*\n"
         f"{full_log_text}\n\n"
         f"Legend: `[05]` Completed \\| ` · ` Missed \\| ` 12` Upcoming"
@@ -259,8 +267,8 @@ async def send_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, 
         try:
             await update_or_query.edit_message_text(text=msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=markup)
             return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Could not edit grid message: {e}")
 
     await send_response(update_or_query, context, msg, reply_markup=markup)
 
@@ -309,7 +317,7 @@ async def send_user_stats(update_or_query, context: ContextTypes.DEFAULT_TYPE, u
         f"└──────────────────────────────┘"
     )
 
-    grid_button = InlineKeyboardMarkup([[InlineKeyboardButton("📅 View My Practice Calendar", callback_data="menu:grid")]])
+    grid_button = InlineKeyboardMarkup([[InlineKeyboardButton("📅 View Full Month Practice Grid", callback_data="menu:grid")]])
 
     msg = (
         f"👤 *PRACTITIONER PROFILE*\n"
@@ -433,7 +441,7 @@ async def send_group_report(update_or_query, context: ContextTypes.DEFAULT_TYPE)
 
 
 # =========================================================
-# AESTHETIC CLOCK & RATE-LIMITED TIMER
+# AESTHETIC CLOCK & TIMER
 # =========================================================
 
 def get_mindful_phase(percent: int) -> str:
@@ -479,7 +487,6 @@ def render_clock_canvas(name: str, mins: int, secs: int, percent: int) -> str:
 
 async def run_live_timer(chat_id: int, user, session: str, context: ContextTypes.DEFAULT_TYPE):
     total_seconds = SESSION_MINUTES * 60
-    # Update every 60 seconds to prevent Telegram 429 Flood Wait rate limits
     update_interval = 60
     user_display = user.first_name or user.username or "Practitioner"
 
@@ -588,6 +595,21 @@ async def button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == "mark_prompt":
             today = get_current_date()
             await send_response(query, context, "🧘 *Practice Check\\-In:*\nChoose instant check\\-in or launch a timer:", reply_markup=build_attendance_keyboard(today, "daily", 0))
+        elif action == "main":
+            await send_response(query, context, "🎛 *Control Center*\nSelect an option below:", reply_markup=build_main_menu_keyboard())
+        return
+
+    if data.startswith("cal:"):
+        await query.answer()
+        _, yr, mo = data.split(":")
+        await send_visual_grid(
+            update_or_query=query,
+            context=context,
+            user=query.from_user,
+            target_year=int(yr),
+            target_month=int(mo),
+            edit_message=True
+        )
         return
 
     if data.startswith("timer:start:"):
@@ -747,7 +769,7 @@ async def main():
 
     app = Application.builder().token(TOKEN).build()
 
-    # Scheduled Jobs
+    # Scheduled Prompts (IST)
     prompts = [
         (time(5, 0, tzinfo=TIMEZONE), ("Morning Dawn Meditation", "Good morning! Welcome the dawn with peaceful awareness.")),
         (time(8, 30, tzinfo=TIMEZONE), ("Mid-Morning Practice Call", "Ground your thoughts and center your presence before the workday accelerates.")),
@@ -765,7 +787,7 @@ async def main():
     for schedule_time, data in catchups:
         app.job_queue.run_daily(scheduled_unmarked_catchup, schedule_time, data=data)
 
-    # Command & Message Handlers
+    # Command Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("attendance", attendance_prompt))

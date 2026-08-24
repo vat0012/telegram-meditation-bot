@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION
 # =========================================================
 
-TOKEN = os.getenv("BOT_TOKEN", "8046423951:AAFK9boL0QaXuidtpKvDmRYjj06txjYI01A")
+TOKEN = os.getenv("BOT_TOKEN", "8046423951:AAFOhmFIdfGnfDcg9askWolxqcrN4Q9GHjU")
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql://neondb_owner:npg_KCSP91Nqtzfk@ep-bold-hall-azziesr6-pooler.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"

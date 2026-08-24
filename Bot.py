@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # BOT CONFIGURATION
 # =========================================================
 
-TOKEN = os.getenv("BOT_TOKEN", "")
+TOKEN = os.getenv("8046423951:AAGgQI2FMeXBT3tyTLIFDym3tqnevaopbQ8", "")
 GROUP_ID = int(os.getenv("GROUP_ID", "-1001234567890"))
 DB_NAME = "attendance.db"
 TIMEZONE = ZoneInfo("Asia/Kolkata")

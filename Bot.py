@@ -31,11 +31,8 @@ logger = logging.getLogger(__name__)
 # BOT CONFIGURATION
 # =========================================================
 
-TOKEN = os.getenv("BOT_TOKEN", "8046423951:AAGgQI2FMeXBT3tyTLIFDym3tqnevaopbQ8")
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://neondb_owner:npg_KCSP91Nqtzfk@ep-bold-hall-azziesr6-pooler.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
-)
+TOKEN = os.getenv("BOT_TOKEN", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 GROUP_ID = int(os.getenv("GROUP_ID", "-4721378655"))
 TIMEZONE = ZoneInfo("Asia/Kolkata")
 SESSION_MINUTES = 20
@@ -69,7 +66,6 @@ def get_zen_title(total_sessions: int) -> str:
 
 async def setup_database():
     global DB_POOL
-    # Clean URL for asyncpg
     clean_url = DATABASE_URL.replace("&channel_binding=require", "").replace("postgres://", "postgresql://")
     DB_POOL = await asyncpg.create_pool(dsn=clean_url, min_size=1, max_size=10)
 
@@ -87,7 +83,7 @@ async def setup_database():
             CREATE INDEX IF NOT EXISTS idx_user_date ON attendance(user_id, attendance_date);
             CREATE INDEX IF NOT EXISTS idx_date_session ON attendance(attendance_date, session);
         """)
-    logger.info("Connected to Neon PostgreSQL and initialized schema.")
+    logger.info("Connected to PostgreSQL and initialized schema.")
 
 
 async def calculate_streak(user_id: int) -> int:
@@ -335,8 +331,7 @@ async def send_user_stats(update_or_query, context: ContextTypes.DEFAULT_TYPE, u
         f"```text\n{stats_card}\n```\n"
         f"📊 *Milestone Progress:*\n"
         f"   └ `{esc(all_time_sessions)}` total 20\\-min sits completed\n"
-        f"   └ `{esc(all_time_days)}` unique days of stillness\n\n"
-        f"🕊 _Each mindful sit waters the seed of clarity\\._"
+        f"   └ `{esc(all_time_days)}` unique days of stillness"
     )
     await send_response(update_or_query, context, msg, reply_markup=grid_button)
 
@@ -387,8 +382,7 @@ async def send_leaderboard(update_or_query, context: ContextTypes.DEFAULT_TYPE):
         f"🏆 *SANGHA PRACTICE LEADERBOARD*\n"
         f"📅 *Period:* `{esc(month_name.upper())}`\n\n"
         f"```text\n{podium_card}\n```\n"
-        f"✨ *Top 10 Dedicated Practitioners:*\n\n" + "\n".join(rows) +
-        f"\n\n🌊 _Praise for walking the path with dedication\\._"
+        f"✨ *Top 10 Dedicated Practitioners:*\n\n" + "\n".join(rows)
     )
     await send_response(update_or_query, context, msg)
 
@@ -434,8 +428,7 @@ async def send_group_report(update_or_query, context: ContextTypes.DEFAULT_TYPE)
         f"🕯 *COMMUNITY PRACTICE REPORT*\n"
         f"📅 *Period:* `{esc(month_name.upper())}`\n\n"
         f"```text\n{summary_card}\n```\n"
-        f"✨ *Active Practitioners Roster:*\n\n{roster_text}\n\n"
-        f"🕊 _Consistency is the seed of deep peace\\._"
+        f"✨ *Active Practitioners Roster:*\n\n{roster_text}"
     )
     await send_response(update_or_query, context, msg)
 
@@ -480,8 +473,7 @@ def render_clock_canvas(name: str, mins: int, secs: int, percent: int) -> str:
     return (
         f"🕯 *{esc(name.upper())}'S PRACTICE ROOM*\n\n"
         f"```text\n{canvas}\n```\n"
-        f"🕊 *State:* _{esc(phase)}_\n"
-        f"🤫 _Hold stillness in the breath and posture\\._"
+        f"🕊 *State:* _{esc(phase)}_"
     )
 
 
@@ -542,7 +534,7 @@ async def run_live_timer(chat_id: int, user, session: str, context: ContextTypes
         f"└──────────────────────────────┘"
     )
     await msg.edit_text(
-        text=f"🕊 *PEACEFUL PRACTICE CONCLUDED*\n\n```text\n{completion_canvas}\n```\n✨ Deep gratitude, *{esc(user_display)}*\\.\n✅ Today's session logged\\.\n{streak_line}",
+        text=f"🕊 *PRACTICE CONCLUDED*\n\n```text\n{completion_canvas}\n```\n*{esc(user_display)}*\n✅ Today's session logged\\.\n{streak_line}",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
@@ -629,7 +621,6 @@ async def button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with DB_POOL.acquire() as conn:
         try:
-            # Check if record already exists
             existing = await conn.fetchval(
                 "SELECT id FROM attendance WHERE user_id = $1 AND attendance_date = $2 AND session = $3",
                 user.id, attendance_date, session
@@ -685,7 +676,7 @@ async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 
 async def scheduled_community_prompt(context: ContextTypes.DEFAULT_TYPE):
-    prompt_title, greeting = context.job.data
+    prompt_title, = context.job.data
     today = get_current_date()
 
     msg = (
@@ -693,8 +684,7 @@ async def scheduled_community_prompt(context: ContextTypes.DEFAULT_TYPE):
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📅 Date: `{esc(today)}`\n"
         f"⏱ Duration: `20 Minutes`\n\n"
-        f"{esc(greeting)}\n"
-        f"Sit down for your 20\\-minute stillness practice now, or check in below:"
+        f"Check in below or start your timer:"
     )
 
     await context.bot.send_message(
@@ -706,7 +696,7 @@ async def scheduled_community_prompt(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def scheduled_unmarked_catchup(context: ContextTypes.DEFAULT_TYPE):
-    alert_title, custom_note = context.job.data
+    alert_title, = context.job.data
     today = get_current_date()
     month = today[:7]
 
@@ -728,10 +718,9 @@ async def scheduled_unmarked_catchup(context: ContextTypes.DEFAULT_TYPE):
     msg = (
         f"🔔 *{esc(alert_title.upper())}*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"These practitioners haven't checked in for today's sit yet:\n\n"
+        f"Unmarked practitioners for today:\n\n"
         f"{member_lines}\n\n"
-        f"{esc(custom_note)}\n"
-        f"Tap below to start your 20\\-min timer or log check\\-in:"
+        f"Tap below to check in or launch your timer:"
     )
 
     await context.bot.send_message(
@@ -775,18 +764,18 @@ async def main():
 
     # Scheduled Prompts (IST)
     prompts = [
-        (time(5, 0, tzinfo=TIMEZONE), ("Morning Dawn Meditation", "Good morning! Welcome the dawn with peaceful awareness.")),
-        (time(8, 30, tzinfo=TIMEZONE), ("Mid-Morning Practice Call", "Ground your thoughts and center your presence before the workday accelerates.")),
-        (time(13, 30, tzinfo=TIMEZONE), ("Midday Stillness Pause", "Step back for 20 minutes of calm breath to reset your mental clarity.")),
-        (time(18, 0, tzinfo=TIMEZONE), ("Evening Sunset Meditation", "Unwind from daily activity and transition into restful evening stillness.")),
+        (time(5, 0, tzinfo=TIMEZONE), ("Morning Dawn Meditation",)),
+        (time(8, 30, tzinfo=TIMEZONE), ("Mid-Morning Practice Call",)),
+        (time(13, 30, tzinfo=TIMEZONE), ("Midday Stillness Pause",)),
+        (time(18, 0, tzinfo=TIMEZONE), ("Evening Sunset Meditation",)),
     ]
     for schedule_time, data in prompts:
         app.job_queue.run_daily(scheduled_community_prompt, schedule_time, data=data)
 
     catchups = [
-        (time(19, 30, tzinfo=TIMEZONE), ("Evening Practice Check", "A gentle reminder to find 20 minutes of peace this evening.")),
-        (time(21, 30, tzinfo=TIMEZONE), ("Night Attendance Reminder", "Wind down your day with mindful meditation before sleep.")),
-        (time(23, 0, tzinfo=TIMEZONE), ("Final Daily Call (11:00 PM)", "Protect your daily practice streak before midnight!")),
+        (time(19, 30, tzinfo=TIMEZONE), ("Evening Practice Check",)),
+        (time(21, 30, tzinfo=TIMEZONE), ("Night Attendance Reminder",)),
+        (time(23, 0, tzinfo=TIMEZONE), ("Final Daily Call (11:00 PM)",)),
     ]
     for schedule_time, data in catchups:
         app.job_queue.run_daily(scheduled_unmarked_catchup, schedule_time, data=data)
@@ -806,10 +795,9 @@ async def main():
     try:
         async with app:
             await app.start()
-            # Clear conflicts from previous polling sessions
             await app.bot.delete_webhook(drop_pending_updates=True)
             await app.updater.start_polling(drop_pending_updates=True)
-            logger.info("Bot started successfully with PostgreSQL.")
+            logger.info("Bot started successfully.")
             while True:
                 await asyncio.sleep(3600)
     finally:

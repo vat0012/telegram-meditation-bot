@@ -5,7 +5,7 @@ import logging
 import os
 from zoneinfo import ZoneInfo
 
-import aiosqlite
+import asyncpg
 from aiohttp import web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -31,12 +31,16 @@ logger = logging.getLogger(__name__)
 # BOT CONFIGURATION
 # =========================================================
 
-# Put your token in the BOT_TOKEN environment variable, or paste it as fallback
 TOKEN = os.getenv("BOT_TOKEN", "8046423951:AAGgQI2FMeXBT3tyTLIFDym3tqnevaopbQ8")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://neondb_owner:npg_KCSP91Nqtzfk@ep-bold-hall-azziesr6-pooler.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
+)
 GROUP_ID = int(os.getenv("GROUP_ID", "-4721378655"))
-DB_NAME = "attendance.db"
 TIMEZONE = ZoneInfo("Asia/Kolkata")
 SESSION_MINUTES = 20
+
+DB_POOL = None
 
 
 def get_current_date() -> str:
@@ -60,41 +64,45 @@ def get_zen_title(total_sessions: int) -> str:
 
 
 # =========================================================
-# DATABASE OPERATIONS (ASYNC)
+# DATABASE OPERATIONS (POSTGRESQL / ASYNCPG)
 # =========================================================
 
 async def setup_database():
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""
+    global DB_POOL
+    # Clean URL for asyncpg
+    clean_url = DATABASE_URL.replace("&channel_binding=require", "").replace("postgres://", "postgresql://")
+    DB_POOL = await asyncpg.create_pool(dsn=clean_url, min_size=1, max_size=10)
+
+    async with DB_POOL.acquire() as conn:
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS attendance (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
                 name TEXT NOT NULL,
                 attendance_date TEXT NOT NULL,
                 session TEXT NOT NULL,
-                duration_minutes INTEGER DEFAULT 20,
+                duration_minutes INT DEFAULT 20,
                 UNIQUE(user_id, attendance_date, session)
-            )
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_date ON attendance(user_id, attendance_date);
+            CREATE INDEX IF NOT EXISTS idx_date_session ON attendance(attendance_date, session);
         """)
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_user_date ON attendance(user_id, attendance_date)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_date_session ON attendance(attendance_date, session)")
-        await db.commit()
+    logger.info("Connected to Neon PostgreSQL and initialized schema.")
 
 
 async def calculate_streak(user_id: int) -> int:
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("""
+    async with DB_POOL.acquire() as conn:
+        rows = await conn.fetch("""
             SELECT DISTINCT attendance_date 
             FROM attendance 
-            WHERE user_id = ? 
+            WHERE user_id = $1 
             ORDER BY attendance_date DESC
-        """, (user_id,)) as cursor:
-            rows = await cursor.fetchall()
+        """, user_id)
 
     if not rows:
         return 0
 
-    dates = {datetime.strptime(r[0], "%Y-%m-%d").date() for r in rows}
+    dates = {datetime.strptime(r["attendance_date"], "%Y-%m-%d").date() for r in rows}
     today = datetime.now(TIMEZONE).date()
     yesterday = today - timedelta(days=1)
 
@@ -182,28 +190,27 @@ async def send_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, 
     month_name = month_dt.strftime("%B %Y")
     days_in_month = calendar.monthrange(year, month)[1]
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
+    async with DB_POOL.acquire() as conn:
+        records = await conn.fetch(
             """
             SELECT attendance_date, session, duration_minutes 
             FROM attendance 
-            WHERE user_id = ? AND attendance_date LIKE ?
+            WHERE user_id = $1 AND attendance_date LIKE $2
             ORDER BY attendance_date ASC, id ASC
             """,
-            (user.id, f"{month_prefix}%")
-        ) as cursor:
-            records = await cursor.fetchall()
+            user.id, f"{month_prefix}%"
+        )
 
     month_data = {}
     total_minutes = 0
     total_sessions = len(records)
 
-    for att_date, session, duration in records:
-        day_num = int(att_date.split("-")[2])
+    for r in records:
+        day_num = int(r["attendance_date"].split("-")[2])
         if day_num not in month_data:
             month_data[day_num] = []
-        month_data[day_num].append(session)
-        total_minutes += (duration or SESSION_MINUTES)
+        month_data[day_num].append(r["session"])
+        total_minutes += (r["duration_minutes"] or SESSION_MINUTES)
 
     attended_days_count = len(month_data)
     completion_rate = int((attended_days_count / days_in_month) * 100)
@@ -278,25 +285,25 @@ async def send_user_stats(update_or_query, context: ContextTypes.DEFAULT_TYPE, u
     today = get_current_date()
     month = today[:7]
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            "SELECT COUNT(*), COUNT(DISTINCT attendance_date) FROM attendance WHERE user_id = ? AND attendance_date LIKE ?",
-            (user_id, f"{month}%")
-        ) as cursor:
-            month_sessions, month_days = await cursor.fetchone()
+    async with DB_POOL.acquire() as conn:
+        r_month = await conn.fetchrow(
+            "SELECT COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days FROM attendance WHERE user_id = $1 AND attendance_date LIKE $2",
+            user_id, f"{month}%"
+        )
+        month_sessions, month_days = r_month["sessions"], r_month["days"]
 
-        async with db.execute(
-            "SELECT COUNT(*), COUNT(DISTINCT attendance_date) FROM attendance WHERE user_id = ?",
-            (user_id,)
-        ) as cursor:
-            all_time_sessions, all_time_days = await cursor.fetchone()
+        r_all = await conn.fetchrow(
+            "SELECT COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days FROM attendance WHERE user_id = $1",
+            user_id
+        )
+        all_time_sessions, all_time_days = r_all["sessions"], r_all["days"]
 
-        async with db.execute("""
+        rank_rows = await conn.fetch("""
             SELECT user_id, COUNT(*) as sessions 
-            FROM attendance WHERE attendance_date LIKE ? 
+            FROM attendance WHERE attendance_date LIKE $1 
             GROUP BY user_id ORDER BY sessions DESC
-        """, (f"{month}%",)) as cursor:
-            rankings = [row[0] for row in await cursor.fetchall()]
+        """, f"{month}%")
+        rankings = [r["user_id"] for r in rank_rows]
 
     user_rank = (rankings.index(user_id) + 1) if user_id in rankings else "—"
     streak = await calculate_streak(user_id)
@@ -339,21 +346,20 @@ async def send_leaderboard(update_or_query, context: ContextTypes.DEFAULT_TYPE):
     month = today[:7]
     month_name = datetime.now(TIMEZONE).strftime("%B %Y")
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("""
+    async with DB_POOL.acquire() as conn:
+        leaders = await conn.fetch("""
             SELECT name, COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days
-            FROM attendance WHERE attendance_date LIKE ? GROUP BY user_id ORDER BY sessions DESC, days DESC LIMIT 10
-        """, (f"{month}%",)) as cursor:
-            leaders = await cursor.fetchall()
+            FROM attendance WHERE attendance_date LIKE $1 GROUP BY user_id, name ORDER BY sessions DESC, days DESC LIMIT 10
+        """, f"{month}%")
 
     if not leaders:
         msg = f"🏆 *SANGHA LEADERBOARD*\n📅 *Month:* `{esc(month_name.upper())}`\n\n_No practice records found yet for this month\\._"
         await send_response(update_or_query, context, msg)
         return
 
-    p1 = leaders[0][0] if len(leaders) > 0 else "---"
-    p2 = leaders[1][0] if len(leaders) > 1 else "---"
-    p3 = leaders[2][0] if len(leaders) > 2 else "---"
+    p1 = leaders[0]["name"] if len(leaders) > 0 else "---"
+    p2 = leaders[1]["name"] if len(leaders) > 1 else "---"
+    p3 = leaders[2]["name"] if len(leaders) > 2 else "---"
 
     p1_fmt = (p1[:10] + "…") if len(p1) > 10 else p1
     p2_fmt = (p2[:8] + "…") if len(p2) > 8 else p2
@@ -373,9 +379,9 @@ async def send_leaderboard(update_or_query, context: ContextTypes.DEFAULT_TYPE):
 
     medals = ["🥇", "🥈", "🥉"]
     rows = []
-    for rank, (name, s_count, d_count) in enumerate(leaders, start=1):
+    for rank, r in enumerate(leaders, start=1):
         badge = medals[rank - 1] if rank <= 3 else f"`{rank:02d}.`"
-        rows.append(f"{badge} *{esc(name)}*\n   └ `{esc(s_count)}` sessions completed • `{esc(d_count)}` days")
+        rows.append(f"{badge} *{esc(r['name'])}*\n   └ `{esc(r['sessions'])}` sessions completed • `{esc(r['days'])}` days")
 
     msg = (
         f"🏆 *SANGHA PRACTICE LEADERBOARD*\n"
@@ -392,21 +398,15 @@ async def send_group_report(update_or_query, context: ContextTypes.DEFAULT_TYPE)
     month = today[:7]
     month_name = datetime.now(TIMEZONE).strftime("%B %Y")
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date = ?", (today,)) as cursor:
-            today_sessions = (await cursor.fetchone())[0]
+    async with DB_POOL.acquire() as conn:
+        today_sessions = await conn.fetchval("SELECT COUNT(*) FROM attendance WHERE attendance_date = $1", today)
+        month_sessions = await conn.fetchval("SELECT COUNT(*) FROM attendance WHERE attendance_date LIKE $1", f"{month}%")
+        all_time_sessions = await conn.fetchval("SELECT COUNT(*) FROM attendance")
 
-        async with db.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date LIKE ?", (f"{month}%",)) as cursor:
-            month_sessions = (await cursor.fetchone())[0]
-
-        async with db.execute("SELECT COUNT(*) FROM attendance") as cursor:
-            all_time_sessions = (await cursor.fetchone())[0]
-
-        async with db.execute("""
+        active_members = await conn.fetch("""
             SELECT name, COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days
-            FROM attendance WHERE attendance_date LIKE ? GROUP BY user_id ORDER BY sessions DESC, days DESC
-        """, (f"{month}%",)) as cursor:
-            active_members = await cursor.fetchall()
+            FROM attendance WHERE attendance_date LIKE $1 GROUP BY user_id, name ORDER BY sessions DESC, days DESC
+        """, f"{month}%")
 
     summary_card = (
         f"┌──────────────────────────────┐\n"
@@ -423,8 +423,8 @@ async def send_group_report(update_or_query, context: ContextTypes.DEFAULT_TYPE)
 
     if active_members:
         member_rows = [
-            f"{'🌿' if r <= 3 else '▫️'} *{esc(name)}*\n   └ `{esc(s)}` sessions • `{esc(d)}` days active"
-            for r, (name, s, d) in enumerate(active_members, start=1)
+            f"{'🌿' if r <= 3 else '▫️'} *{esc(m['name'])}*\n   └ `{esc(m['sessions'])}` sessions • `{esc(m['days'])}` days active"
+            for r, m in enumerate(active_members, start=1)
         ]
         roster_text = "\n".join(member_rows)
     else:
@@ -517,15 +517,15 @@ async def run_live_timer(chat_id: int, user, session: str, context: ContextTypes
     today = get_current_date()
     name = user.full_name or user.username or "Unknown"
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        try:
-            await db.execute(
-                "INSERT INTO attendance (user_id, name, attendance_date, session, duration_minutes) VALUES (?, ?, ?, ?, ?)",
-                (user.id, name, today, session, SESSION_MINUTES),
-            )
-            await db.commit()
-        except aiosqlite.IntegrityError:
-            pass
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO attendance (user_id, name, attendance_date, session, duration_minutes) 
+            VALUES ($1, $2, $3, $4, $5) 
+            ON CONFLICT (user_id, attendance_date, session) DO NOTHING
+            """,
+            user.id, name, today, session, SESSION_MINUTES
+        )
 
     streak = await calculate_streak(user.id)
     streak_line = f"🔥 *Active Practice Streak:* `{streak} days`\n" if streak > 1 else ""
@@ -627,18 +627,25 @@ async def button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = query.from_user
     name = user.full_name or user.username or "Unknown"
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with DB_POOL.acquire() as conn:
         try:
-            await db.execute(
-                "INSERT INTO attendance (user_id, name, attendance_date, session, duration_minutes) VALUES (?, ?, ?, ?, ?)",
-                (user.id, name, attendance_date, session, SESSION_MINUTES),
+            # Check if record already exists
+            existing = await conn.fetchval(
+                "SELECT id FROM attendance WHERE user_id = $1 AND attendance_date = $2 AND session = $3",
+                user.id, attendance_date, session
             )
-            await db.commit()
+            if existing:
+                await query.answer("⚠️ You have already checked in for today's practice!", show_alert=True)
+                return
 
-            async with db.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date = ? AND session = ?", (attendance_date, session)) as cursor:
-                total = (await cursor.fetchone())[0]
+            await conn.execute(
+                "INSERT INTO attendance (user_id, name, attendance_date, session, duration_minutes) VALUES ($1, $2, $3, $4, $5)",
+                user.id, name, attendance_date, session, SESSION_MINUTES
+            )
 
+            total = await conn.fetchval("SELECT COUNT(*) FROM attendance WHERE attendance_date = $1 AND session = $2", attendance_date, session)
             streak = await calculate_streak(user.id)
+            
             try:
                 await query.edit_message_reply_markup(reply_markup=build_attendance_keyboard(attendance_date, session, total))
             except Exception:
@@ -646,8 +653,6 @@ async def button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             streak_text = f" 🔥 Streak: {streak} days!" if streak > 1 else ""
             await query.answer(f"✅ Session logged, {name}!{streak_text} (Total today: {total})", show_alert=False)
-        except aiosqlite.IntegrityError:
-            await query.answer("⚠️ You have already checked in for today's practice!", show_alert=True)
         except Exception as e:
             logger.error(f"Error in button_pressed: {e}")
             await query.answer("⚠️ Failed to record attendance.", show_alert=True)
@@ -705,21 +710,20 @@ async def scheduled_unmarked_catchup(context: ContextTypes.DEFAULT_TYPE):
     today = get_current_date()
     month = today[:7]
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("""
+    async with DB_POOL.acquire() as conn:
+        unmarked_members = await conn.fetch("""
             SELECT DISTINCT user_id, name 
             FROM attendance 
-            WHERE attendance_date LIKE ? 
+            WHERE attendance_date LIKE $1 
               AND user_id NOT IN (
-                  SELECT user_id FROM attendance WHERE attendance_date = ?
+                  SELECT user_id FROM attendance WHERE attendance_date = $2
               )
-        """, (f"{month}%", today)) as cursor:
-            unmarked_members = await cursor.fetchall()
+        """, f"{month}%", today)
 
     if not unmarked_members:
         return
 
-    member_lines = "\n".join([f"• {esc(name)}" for _, name in unmarked_members])
+    member_lines = "\n".join([f"• {esc(r['name'])}" for r in unmarked_members])
 
     msg = (
         f"🔔 *{esc(alert_title.upper())}*\n"
@@ -802,11 +806,15 @@ async def main():
     try:
         async with app:
             await app.start()
+            # Clear conflicts from previous polling sessions
+            await app.bot.delete_webhook(drop_pending_updates=True)
             await app.updater.start_polling(drop_pending_updates=True)
-            logger.info("Bot started successfully.")
+            logger.info("Bot started successfully with PostgreSQL.")
             while True:
                 await asyncio.sleep(3600)
     finally:
+        if DB_POOL:
+            await DB_POOL.close()
         await web_runner.cleanup()
 
 

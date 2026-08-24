@@ -156,20 +156,46 @@ async def send_response(update_or_query, context: ContextTypes.DEFAULT_TYPE, tex
 # VISUAL CALENDAR, STATS, LEADERBOARD, REPORT
 # =========================================================
 
-async def send_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, user):
-    today = datetime.now(TIMEZONE).date()
-    month_prefix = today.isoformat()[:7]
-    month_name = today.strftime("%B %Y")
+async def send_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, user, target_year: int = None, target_month: int = None, edit_message: bool = False):
+    now = datetime.now(TIMEZONE).date()
+    year = target_year or now.year
+    month = target_month or now.month
+
+    month_prefix = f"{year}-{month:02d}"
+    month_dt = datetime(year, month, 1)
+    month_name = month_dt.strftime("%B %Y")
+    days_in_month = calendar.monthrange(year, month)[1]
 
     async with aiosqlite.connect(DB_NAME) as db:
+        # Fetch every session recorded for the entire month
         async with db.execute(
-            "SELECT DISTINCT attendance_date FROM attendance WHERE user_id = ? AND attendance_date LIKE ?",
+            """
+            SELECT attendance_date, session, duration_minutes 
+            FROM attendance 
+            WHERE user_id = ? AND attendance_date LIKE ?
+            ORDER BY attendance_date ASC, id ASC
+            """,
             (user.id, f"{month_prefix}%")
         ) as cursor:
-            rows = await cursor.fetchall()
-            attended_days = {datetime.strptime(r[0], "%Y-%m-%d").date().day for r in rows}
+            records = await cursor.fetchall()
 
-    cal = calendar.monthcalendar(today.year, today.month)
+    # Map records by date: day_number -> list of sessions
+    month_data = {}
+    total_minutes = 0
+    total_sessions = len(records)
+
+    for att_date, session, duration in records:
+        day_num = int(att_date.split("-")[2])
+        if day_num not in month_data:
+            month_data[day_num] = []
+        month_data[day_num].append(session)
+        total_minutes += (duration or SESSION_MINUTES)
+
+    attended_days_count = len(month_data)
+    completion_rate = int((attended_days_count / days_in_month) * 100)
+
+    # 1. ASCII Grid Generation (Shows All Days)
+    cal = calendar.monthcalendar(year, month)
     lines = [
         "╔═════════════════════════════╗",
         f"║    {month_name.center(25)}║",
@@ -183,11 +209,14 @@ async def send_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, 
         for day in week:
             if day == 0:
                 cell = "    "
-            elif day in attended_days:
+            elif day in month_data:
+                # [XX] = Completed
                 cell = f"[{day:02d}]"
-            elif day <= today.day:
+            elif (year < now.year) or (year == now.year and month < now.month) or (year == now.year and month == now.month and day <= now.day):
+                # · = Missed past day
                 cell = "  · "
             else:
+                # Upcoming future day
                 cell = f"  {day:02d}"
             row_str += cell
         row_str += " ║"
@@ -195,17 +224,45 @@ async def send_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, 
 
     lines.append("╚═════════════════════════════╝")
     calendar_ascii = "\n".join(lines)
+
+    # 2. Detailed Month Log / Timeline
+    log_lines = []
+    if month_data:
+        for day in sorted(month_data.keys()):
+            sessions_done = month_data[day]
+            count = len(sessions_done)
+            count_label = f"({count} sits)" if count > 1 else ""
+            log_lines.append(f"`{day:02d} {month_dt.strftime('%b')}` ✅ Completed {count_label}")
+        full_log_text = "\n".join(log_lines)
+    else:
+        full_log_text = "_No sessions recorded for this month\\._"
+
     name = user.first_name or user.username or "Member"
 
     msg = (
-        f"📅 *PRACTICE CALENDAR*\n"
+        f"📅 *FULL MONTH PRACTICE RECORD*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🧘 Member: *{esc(name)}*\n"
-        f"✨ Completed: *{esc(len(attended_days))} days*\n\n"
+        f"📆 Month: *{esc(month_name)}*\n\n"
         f"```text\n{calendar_ascii}\n```\n"
+        f"📊 *Month Summary:*\n"
+        f" └ Days Active: `{esc(attended_days_count)} / {days_in_month}` \\({esc(completion_rate)}%\\)\n"
+        f" └ Total Sits: `{esc(total_sessions)}` \\| Practice Time: `{esc(total_minutes)} mins`\n\n"
+        f"📋 *Daily Practice Ledger:*\n"
+        f"{full_log_text}\n\n"
         f"Legend: `[05]` Completed \\| ` · ` Missed \\| ` 12` Upcoming"
     )
-    await send_response(update_or_query, context, msg)
+
+    markup = build_month_grid_keyboard(year, month)
+
+    if edit_message and hasattr(update_or_query, "edit_message_text"):
+        try:
+            await update_or_query.edit_message_text(text=msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=markup)
+            return
+        except Exception:
+            pass
+
+    await send_response(update_or_query, context, msg, reply_markup=markup)
 
 
 async def send_user_stats(update_or_query, context: ContextTypes.DEFAULT_TYPE, user):

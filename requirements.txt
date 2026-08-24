@@ -2,3 +2,6 @@ python-telegram-bot
 python-telegram-bot[job-queue]
 aiohttp
 pytz
+aiosqlite
+python-telegram-bot 
+aiohttp

@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("BOT_TOKEN", "8046423951:AAG8NqC9yh5sgeGuE4rHdXCW7DwOPQ7oANI")
 GROUP_ID = int(os.getenv("GROUP_ID", "-4721378655"))
-DB_NAME = "attendance.db"
+DB_NAME = os.getenv("DB_PATH", "attendance.db")
 TIMEZONE = ZoneInfo("Asia/Kolkata")
 SESSION_MINUTES = 20
 
@@ -91,11 +91,11 @@ def generate_color_grid(year: int, month: int, attended_days: Set[int], current_
 
 
 # =========================================================
-# DATABASE LAYER (WAL Mode + Thread Offload)
+# DATABASE LAYER (Safe Connection Handling)
 # =========================================================
 
 def _get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_NAME, timeout=10.0)
+    conn = sqlite3.connect(DB_NAME, timeout=15.0)
     conn.execute("PRAGMA journal_mode = WAL;")
     conn.execute("PRAGMA synchronous = NORMAL;")
     conn.execute("PRAGMA busy_timeout = 5000;")
@@ -103,7 +103,8 @@ def _get_db_connection() -> sqlite3.Connection:
 
 
 def _setup_database_sync() -> None:
-    with _get_db_connection() as conn:
+    conn = _get_db_connection()
+    try:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS attendance (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,30 +124,39 @@ def _setup_database_sync() -> None:
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_user_date ON attendance(user_id, attendance_date);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_date_user ON attendance(attendance_date, user_id);")
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _record_attendance_sync(user_id: int, name: str, date_str: str, session: str) -> bool:
+    conn = _get_db_connection()
     try:
-        with _get_db_connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO attendance (user_id, name, attendance_date, session, duration_minutes, status)
-                VALUES (?, ?, ?, ?, ?, 'present')
-                """,
-                (user_id, name, date_str, session, SESSION_MINUTES),
-            )
-            conn.execute("UPDATE attendance SET name = ? WHERE user_id = ?", (name, user_id))
+        conn.execute(
+            """
+            INSERT INTO attendance (user_id, name, attendance_date, session, duration_minutes, status)
+            VALUES (?, ?, ?, ?, ?, 'present')
+            """,
+            (user_id, name, date_str, session, SESSION_MINUTES),
+        )
+        conn.execute("UPDATE attendance SET name = ? WHERE user_id = ?", (name, user_id))
+        conn.commit()
         return True
     except sqlite3.IntegrityError:
         return False
+    finally:
+        conn.close()
 
 
 def _calculate_streak_sync(user_id: int) -> int:
-    with _get_db_connection() as conn:
+    conn = _get_db_connection()
+    try:
         rows = conn.execute(
             "SELECT DISTINCT attendance_date FROM attendance WHERE user_id = ? AND status = 'present' ORDER BY attendance_date DESC",
             (user_id,),
         ).fetchall()
+    finally:
+        conn.close()
 
     if not rows:
         return 0
@@ -167,8 +177,11 @@ def _calculate_streak_sync(user_id: int) -> int:
 
 
 def _get_all_members_sync() -> List[Tuple[int, str]]:
-    with _get_db_connection() as conn:
+    conn = _get_db_connection()
+    try:
         return conn.execute("SELECT DISTINCT user_id, name FROM attendance ORDER BY name ASC").fetchall()
+    finally:
+        conn.close()
 
 
 async def setup_database() -> None:
@@ -266,7 +279,8 @@ async def show_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, 
     _, num_days_in_month = calendar.monthrange(year, month)
 
     def _query():
-        with _get_db_connection() as conn:
+        conn = _get_db_connection()
+        try:
             user_row = conn.execute("SELECT name FROM attendance WHERE user_id = ? LIMIT 1", (target_user_id,)).fetchone()
             name = user_row[0] if user_row else "Member"
             rows = conn.execute(
@@ -274,6 +288,8 @@ async def show_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, 
                 (target_user_id, f"{month_prefix}%"),
             ).fetchall()
             return name, {datetime.strptime(r[0], "%Y-%m-%d").date().day for r in rows}
+        finally:
+            conn.close()
 
     name, attended_days = await asyncio.to_thread(_query)
     
@@ -329,7 +345,8 @@ async def show_member_stats_by_id(update_or_query, context: ContextTypes.DEFAULT
     days_passed = today.day
 
     def _query():
-        with _get_db_connection() as conn:
+        conn = _get_db_connection()
+        try:
             user_row = conn.execute("SELECT name FROM attendance WHERE user_id = ? LIMIT 1", (target_user_id,)).fetchone()
             name = user_row[0] if user_row else "Practitioner"
 
@@ -350,6 +367,8 @@ async def show_member_stats_by_id(update_or_query, context: ContextTypes.DEFAULT
                 ).fetchall()
             ]
             return name, m_sits, m_days, total_sits, total_days, rankings
+        finally:
+            conn.close()
 
     name, m_sits, m_days, total_sits, total_days, rankings = await asyncio.to_thread(_query)
     user_rank = f"#{rankings.index(target_user_id) + 1}" if target_user_id in rankings else "Unranked"
@@ -389,7 +408,8 @@ async def show_member_missed_analytics(update_or_query, context: ContextTypes.DE
     month_prefix = today.isoformat()[:7]
 
     def _query():
-        with _get_db_connection() as conn:
+        conn = _get_db_connection()
+        try:
             user_row = conn.execute("SELECT name FROM attendance WHERE user_id = ? LIMIT 1", (target_user_id,)).fetchone()
             name = user_row[0] if user_row else "Unknown Member"
             
@@ -403,6 +423,8 @@ async def show_member_missed_analytics(update_or_query, context: ContextTypes.DE
             """, (seven_days_ago, f"{month_prefix}%", target_user_id)).fetchone()
             
             return name, stats[0], stats[1], stats[2]
+        finally:
+            conn.close()
 
     name, week_sits, month_sits, total_sits = await asyncio.to_thread(_query)
     week_missed = max(0, 7 - week_sits)
@@ -443,12 +465,15 @@ async def show_leaderboard(update_or_query, context: ContextTypes.DEFAULT_TYPE):
     month_name = datetime.now(TIMEZONE).strftime("%B %Y")
 
     def _query():
-        with _get_db_connection() as conn:
+        conn = _get_db_connection()
+        try:
             return conn.execute(
                 "SELECT name, COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days "
                 "FROM attendance WHERE attendance_date LIKE ? AND status = 'present' GROUP BY user_id ORDER BY sessions DESC, days DESC LIMIT 10",
                 (f"{today[:7]}%",),
             ).fetchall()
+        finally:
+            conn.close()
 
     leaders = await asyncio.to_thread(_query)
     if not leaders:
@@ -471,7 +496,8 @@ async def show_group_report(update_or_query, context: ContextTypes.DEFAULT_TYPE)
     month_name = datetime.now(TIMEZONE).strftime("%B %Y")
 
     def _query():
-        with _get_db_connection() as conn:
+        conn = _get_db_connection()
+        try:
             today_sits = conn.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date = ? AND status = 'present'", (today,)).fetchone()[0]
             month_sits = conn.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date LIKE ? AND status = 'present'", (f"{month}%",)).fetchone()[0]
             total_sits = conn.execute("SELECT COUNT(*) FROM attendance WHERE status = 'present'").fetchone()[0]
@@ -481,6 +507,8 @@ async def show_group_report(update_or_query, context: ContextTypes.DEFAULT_TYPE)
                 (f"{month}%",),
             ).fetchall()
             return today_sits, month_sits, total_sits, active_members
+        finally:
+            conn.close()
 
     today_sits, month_sits, total_sits, active_members = await asyncio.to_thread(_query)
     member_lines = "\n".join([f"• *{esc(name)}* — `{s} sits` \\(`{d}d`\\)" for name, s, d in active_members]) if active_members else "_No active check\\-ins yet this month\\._"
@@ -507,7 +535,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     month_prefix = today[:7]
 
     def _query_today_roster():
-        with _get_db_connection() as conn:
+        conn = _get_db_connection()
+        try:
             all_known = conn.execute(
                 "SELECT DISTINCT user_id, name FROM attendance WHERE attendance_date LIKE ?",
                 (f"{month_prefix}%",),
@@ -523,6 +552,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pending = [name for uid, name in all_known if uid not in completed_uids]
 
             return completed, pending
+        finally:
+            conn.close()
 
     completed, pending = await asyncio.to_thread(_query_today_roster)
 
@@ -684,13 +715,16 @@ async def scheduled_unmarked_catchup(context: ContextTypes.DEFAULT_TYPE):
     month = today[:7]
 
     def _query():
-        with _get_db_connection() as conn:
+        conn = _get_db_connection()
+        try:
             return conn.execute("""
                 SELECT DISTINCT user_id, name FROM attendance 
                 WHERE attendance_date LIKE ? AND user_id NOT IN (
                     SELECT user_id FROM attendance WHERE attendance_date = ? AND status = 'present'
                 )
             """, (f"{month}%", today)).fetchall()
+        finally:
+            conn.close()
 
     unmarked = await asyncio.to_thread(_query)
     if not unmarked:
@@ -724,15 +758,16 @@ async def run_web_server() -> web.AppRunner:
     app.router.add_get("/healthz", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    logger.info(f"Render HTTP health check server live on 0.0.0.0:{port}")
     return runner
 
 
 async def main():
-    await setup_database()
     web_runner = await run_web_server()
+    await setup_database()
 
     app = Application.builder().token(TOKEN).build()
 
@@ -765,7 +800,7 @@ async def main():
         except NotImplementedError:
             pass
 
-    logger.info("Bot starting...")
+    logger.info("Starting Telegram polling...")
     async with app:
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)

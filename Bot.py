@@ -1,15 +1,17 @@
 import asyncio
 import calendar
+from contextlib import contextmanager
 from datetime import datetime, time, timedelta
+import functools
 import logging
 import os
 import signal
-from typing import List, Optional, Set, Tuple
+from typing import Any, Callable, Generator, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
 from aiohttp import web
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2 import pool
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -28,20 +30,24 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("MeditationBot")
 
-TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID", "-4721378655"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 TIMEZONE = ZoneInfo("Asia/Kolkata")
 SESSION_MINUTES = 20
+
+# Global Connection Pool reference
+DB_POOL: Optional[pool.ThreadedConnectionPool] = None
 
 
 # =========================================================
 # UI DESIGN SYSTEM & FORMATTING HELPERS
 # =========================================================
 
-def esc(text: any) -> str:
+def esc(text: Any) -> str:
+    """Escapes strings safely for Telegram MarkdownV2."""
     if text is None:
         return ""
     return escape_markdown(str(text), version=2)
@@ -57,14 +63,21 @@ def render_progress_bar(percentage: int, total_blocks: int = 10) -> str:
     return "▓" * filled + "░" * (total_blocks - filled)
 
 
-def generate_color_grid(year: int, month: int, attended_days: Set[int], current_year: int, current_month: int, current_day: int) -> str:
+def generate_color_grid(
+    year: int,
+    month: int,
+    attended_days: Set[int],
+    current_year: int,
+    current_month: int,
+    current_day: int,
+) -> str:
     cal = calendar.monthcalendar(year, month)
     lines = [
         " Mo  Tu  We  Th  Fr  Sa  Su ",
-        "─────────────────────────────────"
+        "─────────────────────────────────",
     ]
 
-    is_current_month = (year == current_year and month == current_month)
+    is_current_month = year == current_year and month == current_month
     is_past_month = (year < current_year) or (year == current_year and month < current_month)
 
     for week in cal:
@@ -86,90 +99,124 @@ def generate_color_grid(year: int, month: int, attended_days: Set[int], current_
 
 
 # =========================================================
-# RESILIENT DATABASE LAYER (NEON POSTGRESQL)
+# RESILIENT DATABASE LAYER (CONNECTION POOL + RETRIES)
 # =========================================================
 
-def _get_db_connection():
+def init_db_pool() -> None:
+    """Initializes a thread-safe connection pool for Postgres/Neon."""
+    global DB_POOL
     if not DATABASE_URL:
-        raise ValueError("DATABASE_URL environment variable is missing!")
+        raise ValueError("DATABASE_URL environment variable is missing! Please configure it in your dashboard.")
     
-    # Retry up to 3 times to allow Neon compute wake-up
-    last_err = None
-    for _ in range(3):
-        try:
-            conn = psycopg2.connect(
-                DATABASE_URL, 
-                connect_timeout=15, 
-                keepalives=1, 
-                keepalives_idle=30, 
-                keepalives_interval=10, 
-                keepalives_count=5
-            )
-            return conn
-        except Exception as e:
-            last_err = e
-            import time as t
-            t.sleep(1)
-    raise last_err
+    DB_POOL = pool.ThreadedConnectionPool(
+        minconn=2,
+        maxconn=10,
+        dsn=DATABASE_URL,
+        connect_timeout=15,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
+    logger.info("PostgreSQL connection pool initialized successfully.")
 
 
-def _setup_database_sync() -> None:
-    conn = _get_db_connection()
+def close_db_pool() -> None:
+    """Closes all pooled database connections cleanly."""
+    global DB_POOL
+    if DB_POOL and not DB_POOL.closed:
+        DB_POOL.closeall()
+        logger.info("PostgreSQL connection pool closed.")
+
+
+@contextmanager
+def get_db_cursor() -> Generator[Any, None, None]:
+    """Safe context manager to acquire and return a pooled connection & cursor."""
+    if DB_POOL is None:
+        raise RuntimeError("Database pool has not been initialized.")
+    
+    conn = DB_POOL.getconn()
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS attendance (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    name TEXT NOT NULL,
-                    attendance_date TEXT NOT NULL,
-                    session TEXT NOT NULL,
-                    duration_minutes INTEGER DEFAULT 20,
-                    status TEXT DEFAULT 'present',
-                    CONSTRAINT unique_user_date_session UNIQUE(user_id, attendance_date, session)
-                );
-                CREATE INDEX IF NOT EXISTS idx_user_date ON attendance(user_id, attendance_date);
-                CREATE INDEX IF NOT EXISTS idx_date_user ON attendance(attendance_date, user_id);
-            """)
+            yield cur
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
-        conn.close()
+        DB_POOL.putconn(conn)
 
 
+def db_retry(max_retries: int = 3, backoff_factor: float = 0.5) -> Callable:
+    """Decorator to retry transient database connection failures (e.g., Neon cold-start)."""
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_err = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except (psycopg2.OperationalError, psycopg2.DatabaseError) as err:
+                    last_err = err
+                    sleep_time = backoff_factor * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"Database operational error on attempt {attempt}/{max_retries} "
+                        f"in {func.__name__}: {err}. Retrying in {sleep_time:.2f}s..."
+                    )
+                    import time as t
+                    t.sleep(sleep_time)
+            logger.error(f"Function {func.__name__} failed after {max_retries} attempts.")
+            raise last_err
+        return wrapper
+    return decorator
+
+
+@db_retry(max_retries=3)
+def _setup_database_sync() -> None:
+    with get_db_cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS attendance (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                name TEXT NOT NULL,
+                attendance_date TEXT NOT NULL,
+                session TEXT NOT NULL,
+                duration_minutes INTEGER DEFAULT 20,
+                status TEXT DEFAULT 'present',
+                CONSTRAINT unique_user_date_session UNIQUE(user_id, attendance_date, session)
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_date ON attendance(user_id, attendance_date);
+            CREATE INDEX IF NOT EXISTS idx_date_user ON attendance(attendance_date, user_id);
+        """)
+
+
+@db_retry(max_retries=3)
 def _record_attendance_sync(user_id: int, name: str, date_str: str, session: str) -> bool:
-    conn = _get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO attendance (user_id, name, attendance_date, session, duration_minutes, status)
-                VALUES (%s, %s, %s, %s, %s, 'present')
-                ON CONFLICT (user_id, attendance_date, session) DO NOTHING
-                RETURNING id;
-                """,
-                (user_id, name, date_str, session, SESSION_MINUTES),
-            )
-            inserted = cur.fetchone()
-            if inserted:
-                cur.execute("UPDATE attendance SET name = %s WHERE user_id = %s", (name, user_id))
-                conn.commit()
-                return True
-            return False
-    finally:
-        conn.close()
+    with get_db_cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO attendance (user_id, name, attendance_date, session, duration_minutes, status)
+            VALUES (%s, %s, %s, %s, %s, 'present')
+            ON CONFLICT (user_id, attendance_date, session) DO NOTHING
+            RETURNING id;
+            """,
+            (user_id, name, date_str, session, SESSION_MINUTES),
+        )
+        inserted = cur.fetchone()
+        if inserted:
+            cur.execute("UPDATE attendance SET name = %s WHERE user_id = %s", (name, user_id))
+            return True
+        return False
 
 
+@db_retry(max_retries=3)
 def _calculate_streak_sync(user_id: int) -> int:
-    conn = _get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT DISTINCT attendance_date FROM attendance WHERE user_id = %s AND status = 'present' ORDER BY attendance_date DESC",
-                (user_id,),
-            )
-            rows = cur.fetchall()
-    finally:
-        conn.close()
+    with get_db_cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT attendance_date FROM attendance WHERE user_id = %s AND status = 'present' ORDER BY attendance_date DESC",
+            (user_id,),
+        )
+        rows = cur.fetchall()
 
     if not rows:
         return 0
@@ -189,24 +236,24 @@ def _calculate_streak_sync(user_id: int) -> int:
     return streak
 
 
+@db_retry(max_retries=3)
 def _get_all_members_sync() -> List[Tuple[int, str]]:
-    conn = _get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT user_id, name FROM attendance ORDER BY name ASC")
-            return cur.fetchall()
-    finally:
-        conn.close()
+    with get_db_cursor() as cur:
+        cur.execute("SELECT DISTINCT user_id, name FROM attendance ORDER BY name ASC")
+        return cur.fetchall()
 
 
 async def setup_database() -> None:
     await asyncio.to_thread(_setup_database_sync)
 
+
 async def record_attendance(user_id: int, name: str, date_str: str, session: str = "daily") -> bool:
     return await asyncio.to_thread(_record_attendance_sync, user_id, name, date_str, session)
 
+
 async def calculate_streak(user_id: int) -> int:
     return await asyncio.to_thread(_calculate_streak_sync, user_id)
+
 
 async def get_all_members() -> List[Tuple[int, str]]:
     return await asyncio.to_thread(_get_all_members_sync)
@@ -239,7 +286,7 @@ def build_main_keyboard(date_str: Optional[str] = None) -> InlineKeyboardMarkup:
 async def build_member_picker_keyboard(target_action: str, current_user_id: Optional[int] = None) -> InlineKeyboardMarkup:
     members = await get_all_members()
     keyboard: List[List[InlineKeyboardButton]] = []
-    
+
     if target_action == "stats" and current_user_id:
         keyboard.append([InlineKeyboardButton("✨ View My Own Stats", callback_data=f"user:stats:{current_user_id}")])
 
@@ -257,7 +304,7 @@ async def build_member_picker_keyboard(target_action: str, current_user_id: Opti
     return InlineKeyboardMarkup(keyboard)
 
 
-async def reply(update_or_query, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
+async def reply(update_or_query: Any, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
     try:
         if isinstance(update_or_query, Update) and update_or_query.message:
             await update_or_query.message.reply_text(
@@ -277,7 +324,7 @@ async def reply(update_or_query, context: ContextTypes.DEFAULT_TYPE, text: str, 
                 chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=reply_markup
             )
     except Exception as e:
-        logger.error(f"Error rendering message: {e}")
+        logger.error(f"Error rendering message: {e}", exc_info=True)
 
 
 # =========================================================
@@ -289,33 +336,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     formatted_date = datetime.now(TIMEZONE).strftime("%A, %b %d")
     month_prefix = today[:7]
 
+    @db_retry(max_retries=3)
     def _query_today_roster():
-        conn = _get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT DISTINCT user_id, name FROM attendance WHERE attendance_date LIKE %s",
-                    (f"{month_prefix}%",),
-                )
-                all_known = cur.fetchall()
+        with get_db_cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT user_id, name FROM attendance WHERE attendance_date LIKE %s",
+                (f"{month_prefix}%",),
+            )
+            all_known = cur.fetchall()
 
-                cur.execute(
-                    "SELECT user_id, name FROM attendance WHERE attendance_date = %s AND status = 'present'",
-                    (today,),
-                )
-                today_records = cur.fetchall()
+            cur.execute(
+                "SELECT user_id, name FROM attendance WHERE attendance_date = %s AND status = 'present'",
+                (today,),
+            )
+            today_records = cur.fetchall()
 
-            completed = [name for _, name in today_records]
-            completed_uids = {uid for uid, _ in today_records}
-            pending = [name for uid, name in all_known if uid not in completed_uids]
-            return completed, pending
-        finally:
-            conn.close()
+        completed = [name for _, name in today_records]
+        completed_uids = {uid for uid, _ in today_records}
+        pending = [name for uid, name in all_known if uid not in completed_uids]
+        return completed, pending
 
     try:
         completed, pending = await asyncio.to_thread(_query_today_roster)
     except Exception as e:
-        logger.error(f"DB error in start: {e}")
+        logger.error(f"Failed to load roster in start handler: {e}")
         completed, pending = [], []
 
     completed_str = " • ".join([f"`{esc(n)}`" for n in completed]) if completed else "`None`"
@@ -334,7 +378,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply(update, context, msg, reply_markup=build_main_keyboard(today))
 
 
-async def show_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, target_user_id: int, year: Optional[int] = None, month: Optional[int] = None):
+async def show_visual_grid(update_or_query: Any, context: ContextTypes.DEFAULT_TYPE, target_user_id: int, year: Optional[int] = None, month: Optional[int] = None):
     today = datetime.now(TIMEZONE).date()
     year = year or today.year
     month = month or today.month
@@ -342,25 +386,22 @@ async def show_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, 
     month_name = datetime(year, month, 1).strftime("%B %Y")
     _, num_days_in_month = calendar.monthrange(year, month)
 
+    @db_retry(max_retries=3)
     def _query():
-        conn = _get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT name FROM attendance WHERE user_id = %s LIMIT 1", (target_user_id,))
-                user_row = cur.fetchone()
-                name = user_row[0] if user_row else "Member"
+        with get_db_cursor() as cur:
+            cur.execute("SELECT name FROM attendance WHERE user_id = %s LIMIT 1", (target_user_id,))
+            user_row = cur.fetchone()
+            name = user_row[0] if user_row else "Member"
 
-                cur.execute(
-                    "SELECT DISTINCT attendance_date FROM attendance WHERE user_id = %s AND attendance_date LIKE %s AND status = 'present'",
-                    (target_user_id, f"{month_prefix}%"),
-                )
-                rows = cur.fetchall()
-            return name, {datetime.strptime(r[0], "%Y-%m-%d").date().day for r in rows}
-        finally:
-            conn.close()
+            cur.execute(
+                "SELECT DISTINCT attendance_date FROM attendance WHERE user_id = %s AND attendance_date LIKE %s AND status = 'present'",
+                (target_user_id, f"{month_prefix}%"),
+            )
+            rows = cur.fetchall()
+        return name, {datetime.strptime(r[0], "%Y-%m-%d").date().day for r in rows}
 
     name, attended_days = await asyncio.to_thread(_query)
-    is_current_month = (year == today.year and month == today.month)
+    is_current_month = year == today.year and month == today.month
     is_past_month = (year < today.year) or (year == today.year and month < today.month)
     grid_ascii = generate_color_grid(year, month, attended_days, today.year, today.month, today.day)
 
@@ -404,40 +445,37 @@ async def show_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, 
     await reply(update_or_query, context, msg, reply_markup=nav_buttons)
 
 
-async def show_member_stats_by_id(update_or_query, context: ContextTypes.DEFAULT_TYPE, target_user_id: int):
+async def show_member_stats_by_id(update_or_query: Any, context: ContextTypes.DEFAULT_TYPE, target_user_id: int):
     today = datetime.now(TIMEZONE).date()
     month = today.isoformat()[:7]
     month_name = today.strftime("%B %Y")
     days_passed = today.day
 
+    @db_retry(max_retries=3)
     def _query():
-        conn = _get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT name FROM attendance WHERE user_id = %s LIMIT 1", (target_user_id,))
-                user_row = cur.fetchone()
-                name = user_row[0] if user_row else "Practitioner"
+        with get_db_cursor() as cur:
+            cur.execute("SELECT name FROM attendance WHERE user_id = %s LIMIT 1", (target_user_id,))
+            user_row = cur.fetchone()
+            name = user_row[0] if user_row else "Practitioner"
 
-                cur.execute(
-                    "SELECT COUNT(*), COUNT(DISTINCT attendance_date) FROM attendance WHERE user_id = %s AND attendance_date LIKE %s AND status = 'present'",
-                    (target_user_id, f"{month}%"),
-                )
-                m_sits, m_days = cur.fetchone()
+            cur.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT attendance_date) FROM attendance WHERE user_id = %s AND attendance_date LIKE %s AND status = 'present'",
+                (target_user_id, f"{month}%"),
+            )
+            m_sits, m_days = cur.fetchone()
 
-                cur.execute(
-                    "SELECT COUNT(*), COUNT(DISTINCT attendance_date) FROM attendance WHERE user_id = %s AND status = 'present'",
-                    (target_user_id,),
-                )
-                total_sits, total_days = cur.fetchone()
+            cur.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT attendance_date) FROM attendance WHERE user_id = %s AND status = 'present'",
+                (target_user_id,),
+            )
+            total_sits, total_days = cur.fetchone()
 
-                cur.execute(
-                    "SELECT user_id FROM attendance WHERE attendance_date LIKE %s AND status = 'present' GROUP BY user_id ORDER BY COUNT(*) DESC, COUNT(DISTINCT attendance_date) DESC",
-                    (f"{month}%",),
-                )
-                rankings = [r[0] for r in cur.fetchall()]
-            return name, m_sits, m_days, total_sits, total_days, rankings
-        finally:
-            conn.close()
+            cur.execute(
+                "SELECT user_id FROM attendance WHERE attendance_date LIKE %s AND status = 'present' GROUP BY user_id ORDER BY COUNT(*) DESC, COUNT(DISTINCT attendance_date) DESC",
+                (f"{month}%",),
+            )
+            rankings = [r[0] for r in cur.fetchall()]
+        return name, m_sits, m_days, total_sits, total_days, rankings
 
     name, m_sits, m_days, total_sits, total_days, rankings = await asyncio.to_thread(_query)
     user_rank = f"#{rankings.index(target_user_id) + 1}" if target_user_id in rankings else "Unranked"
@@ -470,32 +508,29 @@ async def show_member_stats_by_id(update_or_query, context: ContextTypes.DEFAULT
     await reply(update_or_query, context, msg, reply_markup=nav_buttons)
 
 
-async def show_member_missed_analytics(update_or_query, context: ContextTypes.DEFAULT_TYPE, target_user_id: int):
+async def show_member_missed_analytics(update_or_query: Any, context: ContextTypes.DEFAULT_TYPE, target_user_id: int):
     today = datetime.now(TIMEZONE).date()
     days_in_month_so_far = today.day
     seven_days_ago = (today - timedelta(days=6)).isoformat()
     month_prefix = today.isoformat()[:7]
 
+    @db_retry(max_retries=3)
     def _query():
-        conn = _get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT name FROM attendance WHERE user_id = %s LIMIT 1", (target_user_id,))
-                user_row = cur.fetchone()
-                name = user_row[0] if user_row else "Unknown Member"
+        with get_db_cursor() as cur:
+            cur.execute("SELECT name FROM attendance WHERE user_id = %s LIMIT 1", (target_user_id,))
+            user_row = cur.fetchone()
+            name = user_row[0] if user_row else "Unknown Member"
 
-                cur.execute("""
-                    SELECT 
-                        COUNT(DISTINCT CASE WHEN attendance_date >= %s AND status = 'present' THEN attendance_date END),
-                        COUNT(DISTINCT CASE WHEN attendance_date LIKE %s AND status = 'present' THEN attendance_date END),
-                        COUNT(DISTINCT CASE WHEN status = 'present' THEN attendance_date END)
-                    FROM attendance
-                    WHERE user_id = %s
-                """, (seven_days_ago, f"{month_prefix}%", target_user_id))
-                stats = cur.fetchone()
-            return name, stats[0], stats[1], stats[2]
-        finally:
-            conn.close()
+            cur.execute("""
+                SELECT 
+                    COUNT(DISTINCT CASE WHEN attendance_date >= %s AND status = 'present' THEN attendance_date END),
+                    COUNT(DISTINCT CASE WHEN attendance_date LIKE %s AND status = 'present' THEN attendance_date END),
+                    COUNT(DISTINCT CASE WHEN status = 'present' THEN attendance_date END)
+                FROM attendance
+                WHERE user_id = %s
+            """, (seven_days_ago, f"{month_prefix}%", target_user_id))
+            stats = cur.fetchone()
+        return name, stats[0], stats[1], stats[2]
 
     name, week_sits, month_sits, total_sits = await asyncio.to_thread(_query)
     week_missed = max(0, 7 - week_sits)
@@ -529,22 +564,19 @@ async def show_member_missed_analytics(update_or_query, context: ContextTypes.DE
     await reply(update_or_query, context, msg, reply_markup=nav_buttons)
 
 
-async def show_leaderboard(update_or_query, context: ContextTypes.DEFAULT_TYPE):
+async def show_leaderboard(update_or_query: Any, context: ContextTypes.DEFAULT_TYPE):
     today = get_current_date()
     month_name = datetime.now(TIMEZONE).strftime("%B %Y")
 
+    @db_retry(max_retries=3)
     def _query():
-        conn = _get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT name, COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days "
-                    "FROM attendance WHERE attendance_date LIKE %s AND status = 'present' GROUP BY user_id, name ORDER BY sessions DESC, days DESC LIMIT 10",
-                    (f"{today[:7]}%",),
-                )
-                return cur.fetchall()
-        finally:
-            conn.close()
+        with get_db_cursor() as cur:
+            cur.execute(
+                "SELECT name, COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days "
+                "FROM attendance WHERE attendance_date LIKE %s AND status = 'present' GROUP BY user_id, name ORDER BY sessions DESC, days DESC LIMIT 10",
+                (f"{today[:7]}%",),
+            )
+            return cur.fetchall()
 
     leaders = await asyncio.to_thread(_query)
     if not leaders:
@@ -561,33 +593,30 @@ async def show_leaderboard(update_or_query, context: ContextTypes.DEFAULT_TYPE):
     await reply(update_or_query, context, msg, reply_markup=build_main_keyboard())
 
 
-async def show_group_report(update_or_query, context: ContextTypes.DEFAULT_TYPE):
+async def show_group_report(update_or_query: Any, context: ContextTypes.DEFAULT_TYPE):
     today = get_current_date()
     month = today[:7]
     month_name = datetime.now(TIMEZONE).strftime("%B %Y")
 
+    @db_retry(max_retries=3)
     def _query():
-        conn = _get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date = %s AND status = 'present'", (today,))
-                today_sits = cur.fetchone()[0]
+        with get_db_cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date = %s AND status = 'present'", (today,))
+            today_sits = cur.fetchone()[0]
 
-                cur.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date LIKE %s AND status = 'present'", (f"{month}%",))
-                month_sits = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date LIKE %s AND status = 'present'", (f"{month}%",))
+            month_sits = cur.fetchone()[0]
 
-                cur.execute("SELECT COUNT(*) FROM attendance WHERE status = 'present'")
-                total_sits = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM attendance WHERE status = 'present'")
+            total_sits = cur.fetchone()[0]
 
-                cur.execute(
-                    "SELECT name, COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days "
-                    "FROM attendance WHERE attendance_date LIKE %s AND status = 'present' GROUP BY user_id, name ORDER BY sessions DESC, days DESC",
-                    (f"{month}%",),
-                )
-                active_members = cur.fetchall()
-            return today_sits, month_sits, total_sits, active_members
-        finally:
-            conn.close()
+            cur.execute(
+                "SELECT name, COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days "
+                "FROM attendance WHERE attendance_date LIKE %s AND status = 'present' GROUP BY user_id, name ORDER BY sessions DESC, days DESC",
+                (f"{month}%",),
+            )
+            active_members = cur.fetchall()
+        return today_sits, month_sits, total_sits, active_members
 
     today_sits, month_sits, total_sits, active_members = await asyncio.to_thread(_query)
     member_lines = "\n".join([f"• *{esc(name)}* — `{s} sits` \\(`{d}d`\\)" for name, s, d in active_members]) if active_members else "_No active check\\-ins yet this month\\._"
@@ -636,7 +665,7 @@ async def button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         titles = {
             "missed": "Missed Analytics",
             "grid": "Calendar Matrix",
-            "stats": "Member Stats"
+            "stats": "Member Stats",
         }
         title = titles.get(action, "Member")
         kb = await build_member_picker_keyboard(action, current_user_id=user.id)
@@ -672,6 +701,7 @@ async def button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await start(query, context)
         return
 
+    # Dynamic Morphing Check-in Button
     if data.startswith("attend:"):
         _, date_str, session = data.split(":")
         await query.answer()
@@ -731,19 +761,16 @@ async def scheduled_unmarked_catchup(context: ContextTypes.DEFAULT_TYPE):
     today = get_current_date()
     month = today[:7]
 
+    @db_retry(max_retries=3)
     def _query():
-        conn = _get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT DISTINCT user_id, name FROM attendance 
-                    WHERE attendance_date LIKE %s AND user_id NOT IN (
-                        SELECT user_id FROM attendance WHERE attendance_date = %s AND status = 'present'
-                    )
-                """, (f"{month}%", today))
-                return cur.fetchall()
-        finally:
-            conn.close()
+        with get_db_cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT user_id, name FROM attendance 
+                WHERE attendance_date LIKE %s AND user_id NOT IN (
+                    SELECT user_id FROM attendance WHERE attendance_date = %s AND status = 'present'
+                )
+            """, (f"{month}%", today))
+            return cur.fetchall()
 
     unmarked = await asyncio.to_thread(_query)
     if not unmarked:
@@ -767,7 +794,7 @@ async def scheduled_unmarked_catchup(context: ContextTypes.DEFAULT_TYPE):
 # WEB SERVER & ERROR HANDLING
 # =========================================================
 
-async def handle_ping(request):
+async def handle_ping(request: web.Request) -> web.Response:
     return web.Response(text="Bot is running.")
 
 
@@ -780,21 +807,31 @@ async def run_web_server() -> web.AppRunner:
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"Health check server active on port {port}")
+    logger.info(f"Health check HTTP endpoint running on 0.0.0.0:{port}")
     return runner
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Exception while handling an update:", exc_info=context.error)
+    logger.error("Exception encountered while handling an update:", exc_info=context.error)
 
+
+# =========================================================
+# APPLICATION LIFECYCLE
+# =========================================================
 
 async def main():
-    web_runner = await run_web_server()
+    init_db_pool()
     await setup_database()
+
+    web_runner = await run_web_server()
+
+    if not TOKEN or TOKEN == "YOUR_BOT_TOKEN_HERE":
+        raise ValueError("BOT_TOKEN environment variable is not set!")
 
     app = Application.builder().token(TOKEN).build()
     app.add_error_handler(error_handler)
 
+    # Schedule Cron Alerts
     schedules = [
         (scheduled_community_prompt, time(5, 0, tzinfo=TIMEZONE), "Morning Meditation (5:00 AM)"),
         (scheduled_community_prompt, time(8, 30, tzinfo=TIMEZONE), "Mid-Morning Meditation (8:30 AM)"),
@@ -807,6 +844,7 @@ async def main():
     for callback, schedule_time, title in schedules:
         app.job_queue.run_daily(callback, schedule_time, data=title)
 
+    # Command & Query Handlers
     app.add_handler(CommandHandler(["start", "menu", "attendance"], start))
     app.add_handler(CommandHandler(["stats", "mystats", "my"], handle_stats_command))
     app.add_handler(CommandHandler("leaderboard", show_leaderboard))
@@ -816,26 +854,33 @@ async def main():
     app.add_handler(CommandHandler("id", lambda u, c: reply(u, c, f"Chat ID: `{esc(u.effective_chat.id)}`")))
     app.add_handler(CallbackQueryHandler(button_pressed))
 
-    logger.info("Starting Telegram polling with Neon Postgres...")
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            pass  # Windows compatibility fallback
+
+    logger.info("Starting Telegram polling with Neon Postgres & Connection Pooling...")
     async with app:
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
         
-        # Idle loop that keeps the container and event loop alive
-        try:
-            while True:
-                await asyncio.sleep(3600)
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            pass
-        finally:
-            logger.info("Shutting down...")
-            await app.updater.stop()
-            await app.stop()
-            await web_runner.cleanup()
+        # Block until termination signal is caught
+        await stop_event.wait()
+        
+        logger.info("Termination signal received. Gracefully stopping services...")
+        await app.updater.stop()
+        await app.stop()
+        await web_runner.cleanup()
+        close_db_pool()
+        logger.info("Bot stopped cleanly.")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Process terminated.")
+        logger.info("Bot process exited.")

@@ -4,11 +4,12 @@ from datetime import datetime, time, timedelta
 import logging
 import os
 import signal
-import sqlite3
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
 from aiohttp import web
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("BOT_TOKEN", "8046423951:AAG8NqC9yh5sgeGuE4rHdXCW7DwOPQ7oANI")
 GROUP_ID = int(os.getenv("GROUP_ID", "-4721378655"))
-DB_NAME = os.getenv("DB_PATH", "attendance.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 TIMEZONE = ZoneInfo("Asia/Kolkata")
 SESSION_MINUTES = 20
 
@@ -52,17 +53,12 @@ def get_current_date() -> str:
 
 
 def render_progress_bar(percentage: int, total_blocks: int = 10) -> str:
-    """Renders a Material-style progress bar."""
     filled = int(round((percentage / 100) * total_blocks))
     filled = max(0, min(total_blocks, filled))
     return "▓" * filled + "░" * (total_blocks - filled)
 
 
 def generate_color_grid(year: int, month: int, attended_days: Set[int], current_year: int, current_month: int, current_day: int) -> str:
-    """
-    Renders High-Contrast Color Emoji Grid (Mo-Su):
-    🟩 Present | 🟥 Absent | 🟨 Today (Unchecked) | ⬜ Upcoming
-    """
     cal = calendar.monthcalendar(year, month)
     lines = [
         " Mo  Tu  We  Th  Fr  Sa  Su ",
@@ -91,39 +87,33 @@ def generate_color_grid(year: int, month: int, attended_days: Set[int], current_
 
 
 # =========================================================
-# DATABASE LAYER (Safe Connection Handling)
+# DATABASE LAYER (NEON POSTGRESQL)
 # =========================================================
 
-def _get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_NAME, timeout=15.0)
-    conn.execute("PRAGMA journal_mode = WAL;")
-    conn.execute("PRAGMA synchronous = NORMAL;")
-    conn.execute("PRAGMA busy_timeout = 5000;")
-    return conn
+def _get_db_connection():
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL environment variable is missing! Please set it in Render.")
+    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
 
 
 def _setup_database_sync() -> None:
     conn = _get_db_connection()
     try:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS attendance (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                attendance_date TEXT NOT NULL,
-                session TEXT NOT NULL,
-                duration_minutes INTEGER DEFAULT 20,
-                status TEXT DEFAULT 'present',
-                UNIQUE(user_id, attendance_date, session)
-            )
-        """)
-        cursor = conn.execute("PRAGMA table_info(attendance);")
-        columns = [row[1] for row in cursor.fetchall()]
-        if "status" not in columns:
-            conn.execute("ALTER TABLE attendance ADD COLUMN status TEXT DEFAULT 'present';")
-
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_user_date ON attendance(user_id, attendance_date);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_date_user ON attendance(attendance_date, user_id);")
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS attendance (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    name TEXT NOT NULL,
+                    attendance_date TEXT NOT NULL,
+                    session TEXT NOT NULL,
+                    duration_minutes INTEGER DEFAULT 20,
+                    status TEXT DEFAULT 'present',
+                    CONSTRAINT unique_user_date_session UNIQUE(user_id, attendance_date, session)
+                );
+                CREATE INDEX IF NOT EXISTS idx_user_date ON attendance(user_id, attendance_date);
+                CREATE INDEX IF NOT EXISTS idx_date_user ON attendance(attendance_date, user_id);
+            """)
         conn.commit()
     finally:
         conn.close()
@@ -132,18 +122,22 @@ def _setup_database_sync() -> None:
 def _record_attendance_sync(user_id: int, name: str, date_str: str, session: str) -> bool:
     conn = _get_db_connection()
     try:
-        conn.execute(
-            """
-            INSERT INTO attendance (user_id, name, attendance_date, session, duration_minutes, status)
-            VALUES (?, ?, ?, ?, ?, 'present')
-            """,
-            (user_id, name, date_str, session, SESSION_MINUTES),
-        )
-        conn.execute("UPDATE attendance SET name = ? WHERE user_id = ?", (name, user_id))
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO attendance (user_id, name, attendance_date, session, duration_minutes, status)
+                VALUES (%s, %s, %s, %s, %s, 'present')
+                ON CONFLICT (user_id, attendance_date, session) DO NOTHING
+                RETURNING id;
+                """,
+                (user_id, name, date_str, session, SESSION_MINUTES),
+            )
+            inserted = cur.fetchone()
+            if inserted:
+                cur.execute("UPDATE attendance SET name = %s WHERE user_id = %s", (name, user_id))
+                conn.commit()
+                return True
+            return False
     finally:
         conn.close()
 
@@ -151,10 +145,12 @@ def _record_attendance_sync(user_id: int, name: str, date_str: str, session: str
 def _calculate_streak_sync(user_id: int) -> int:
     conn = _get_db_connection()
     try:
-        rows = conn.execute(
-            "SELECT DISTINCT attendance_date FROM attendance WHERE user_id = ? AND status = 'present' ORDER BY attendance_date DESC",
-            (user_id,),
-        ).fetchall()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT attendance_date FROM attendance WHERE user_id = %s AND status = 'present' ORDER BY attendance_date DESC",
+                (user_id,),
+            )
+            rows = cur.fetchall()
     finally:
         conn.close()
 
@@ -179,7 +175,9 @@ def _calculate_streak_sync(user_id: int) -> int:
 def _get_all_members_sync() -> List[Tuple[int, str]]:
     conn = _get_db_connection()
     try:
-        return conn.execute("SELECT DISTINCT user_id, name FROM attendance ORDER BY name ASC").fetchall()
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT user_id, name FROM attendance ORDER BY name ASC")
+            return cur.fetchall()
     finally:
         conn.close()
 
@@ -198,7 +196,7 @@ async def get_all_members() -> List[Tuple[int, str]]:
 
 
 # =========================================================
-# KEYBOARD BUILDERS
+# KEYBOARDS & UI DISPATCH
 # =========================================================
 
 def build_main_keyboard(date_str: Optional[str] = None) -> InlineKeyboardMarkup:
@@ -266,14 +264,59 @@ async def reply(update_or_query, context: ContextTypes.DEFAULT_TYPE, text: str, 
 
 
 # =========================================================
-# MATERIAL VIEWPORTS & DATA CARDS
+# HANDLERS
 # =========================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    today = get_current_date()
+    formatted_date = datetime.now(TIMEZONE).strftime("%A, %b %d")
+    month_prefix = today[:7]
+
+    def _query_today_roster():
+        conn = _get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT user_id, name FROM attendance WHERE attendance_date LIKE %s",
+                    (f"{month_prefix}%",),
+                )
+                all_known = cur.fetchall()
+
+                cur.execute(
+                    "SELECT user_id, name FROM attendance WHERE attendance_date = %s AND status = 'present'",
+                    (today,),
+                )
+                today_records = cur.fetchall()
+
+            completed = [name for _, name in today_records]
+            completed_uids = {uid for uid, _ in today_records}
+            pending = [name for uid, name in all_known if uid not in completed_uids]
+            return completed, pending
+        finally:
+            conn.close()
+
+    completed, pending = await asyncio.to_thread(_query_today_roster)
+
+    completed_str = " • ".join([f"`{esc(n)}`" for n in completed]) if completed else "`None`"
+    pending_str = " • ".join([f"`{esc(n)}`" for n in pending]) if pending else "`None`"
+
+    msg = (
+        f"🧘 *MEDITATION DASHBOARD*\n"
+        f"`{esc(formatted_date)} • 20m Sit`\n"
+        f"─────────────────────────────\n"
+        f"🟢 Done \\({len(completed)}\\): {completed_str}\n"
+        f"🔴 Left \\({len(pending)}\\): {pending_str}\n"
+        f"─────────────────────────────\n"
+        f"Select an option below:"
+    )
+
+    await reply(update, context, msg, reply_markup=build_main_keyboard(today))
+
 
 async def show_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, target_user_id: int, year: Optional[int] = None, month: Optional[int] = None):
     today = datetime.now(TIMEZONE).date()
     year = year or today.year
     month = month or today.month
-
     month_prefix = f"{year:04d}-{month:02d}"
     month_name = datetime(year, month, 1).strftime("%B %Y")
     _, num_days_in_month = calendar.monthrange(year, month)
@@ -281,21 +324,23 @@ async def show_visual_grid(update_or_query, context: ContextTypes.DEFAULT_TYPE, 
     def _query():
         conn = _get_db_connection()
         try:
-            user_row = conn.execute("SELECT name FROM attendance WHERE user_id = ? LIMIT 1", (target_user_id,)).fetchone()
-            name = user_row[0] if user_row else "Member"
-            rows = conn.execute(
-                "SELECT DISTINCT attendance_date FROM attendance WHERE user_id = ? AND attendance_date LIKE ? AND status = 'present'",
-                (target_user_id, f"{month_prefix}%"),
-            ).fetchall()
+            with conn.cursor() as cur:
+                cur.execute("SELECT name FROM attendance WHERE user_id = %s LIMIT 1", (target_user_id,))
+                user_row = cur.fetchone()
+                name = user_row[0] if user_row else "Member"
+
+                cur.execute(
+                    "SELECT DISTINCT attendance_date FROM attendance WHERE user_id = %s AND attendance_date LIKE %s AND status = 'present'",
+                    (target_user_id, f"{month_prefix}%"),
+                )
+                rows = cur.fetchall()
             return name, {datetime.strptime(r[0], "%Y-%m-%d").date().day for r in rows}
         finally:
             conn.close()
 
     name, attended_days = await asyncio.to_thread(_query)
-    
     is_current_month = (year == today.year and month == today.month)
     is_past_month = (year < today.year) or (year == today.year and month < today.month)
-
     grid_ascii = generate_color_grid(year, month, attended_days, today.year, today.month, today.day)
 
     completed_count = len(attended_days)
@@ -347,25 +392,28 @@ async def show_member_stats_by_id(update_or_query, context: ContextTypes.DEFAULT
     def _query():
         conn = _get_db_connection()
         try:
-            user_row = conn.execute("SELECT name FROM attendance WHERE user_id = ? LIMIT 1", (target_user_id,)).fetchone()
-            name = user_row[0] if user_row else "Practitioner"
+            with conn.cursor() as cur:
+                cur.execute("SELECT name FROM attendance WHERE user_id = %s LIMIT 1", (target_user_id,))
+                user_row = cur.fetchone()
+                name = user_row[0] if user_row else "Practitioner"
 
-            m_sits, m_days = conn.execute(
-                "SELECT COUNT(*), COUNT(DISTINCT attendance_date) FROM attendance WHERE user_id = ? AND attendance_date LIKE ? AND status = 'present'",
-                (target_user_id, f"{month}%"),
-            ).fetchone()
+                cur.execute(
+                    "SELECT COUNT(*), COUNT(DISTINCT attendance_date) FROM attendance WHERE user_id = %s AND attendance_date LIKE %s AND status = 'present'",
+                    (target_user_id, f"{month}%"),
+                )
+                m_sits, m_days = cur.fetchone()
 
-            total_sits, total_days = conn.execute(
-                "SELECT COUNT(*), COUNT(DISTINCT attendance_date) FROM attendance WHERE user_id = ? AND status = 'present'",
-                (target_user_id,),
-            ).fetchone()
+                cur.execute(
+                    "SELECT COUNT(*), COUNT(DISTINCT attendance_date) FROM attendance WHERE user_id = %s AND status = 'present'",
+                    (target_user_id,),
+                )
+                total_sits, total_days = cur.fetchone()
 
-            rankings = [
-                r[0] for r in conn.execute(
-                    "SELECT user_id FROM attendance WHERE attendance_date LIKE ? AND status = 'present' GROUP BY user_id ORDER BY COUNT(*) DESC, COUNT(DISTINCT attendance_date) DESC",
+                cur.execute(
+                    "SELECT user_id FROM attendance WHERE attendance_date LIKE %s AND status = 'present' GROUP BY user_id ORDER BY COUNT(*) DESC, COUNT(DISTINCT attendance_date) DESC",
                     (f"{month}%",),
-                ).fetchall()
-            ]
+                )
+                rankings = [r[0] for r in cur.fetchall()]
             return name, m_sits, m_days, total_sits, total_days, rankings
         finally:
             conn.close()
@@ -410,18 +458,20 @@ async def show_member_missed_analytics(update_or_query, context: ContextTypes.DE
     def _query():
         conn = _get_db_connection()
         try:
-            user_row = conn.execute("SELECT name FROM attendance WHERE user_id = ? LIMIT 1", (target_user_id,)).fetchone()
-            name = user_row[0] if user_row else "Unknown Member"
-            
-            stats = conn.execute("""
-                SELECT 
-                    COUNT(DISTINCT CASE WHEN attendance_date >= ? AND status = 'present' THEN attendance_date END),
-                    COUNT(DISTINCT CASE WHEN attendance_date LIKE ? AND status = 'present' THEN attendance_date END),
-                    COUNT(DISTINCT CASE WHEN status = 'present' THEN attendance_date END)
-                FROM attendance
-                WHERE user_id = ?
-            """, (seven_days_ago, f"{month_prefix}%", target_user_id)).fetchone()
-            
+            with conn.cursor() as cur:
+                cur.execute("SELECT name FROM attendance WHERE user_id = %s LIMIT 1", (target_user_id,))
+                user_row = cur.fetchone()
+                name = user_row[0] if user_row else "Unknown Member"
+
+                cur.execute("""
+                    SELECT 
+                        COUNT(DISTINCT CASE WHEN attendance_date >= %s AND status = 'present' THEN attendance_date END),
+                        COUNT(DISTINCT CASE WHEN attendance_date LIKE %s AND status = 'present' THEN attendance_date END),
+                        COUNT(DISTINCT CASE WHEN status = 'present' THEN attendance_date END)
+                    FROM attendance
+                    WHERE user_id = %s
+                """, (seven_days_ago, f"{month_prefix}%", target_user_id))
+                stats = cur.fetchone()
             return name, stats[0], stats[1], stats[2]
         finally:
             conn.close()
@@ -429,11 +479,9 @@ async def show_member_missed_analytics(update_or_query, context: ContextTypes.DE
     name, week_sits, month_sits, total_sits = await asyncio.to_thread(_query)
     week_missed = max(0, 7 - week_sits)
     month_missed = max(0, days_in_month_so_far - month_sits)
-
     streak = await calculate_streak(target_user_id)
     rate = int((month_sits / days_in_month_so_far) * 100) if days_in_month_so_far > 0 else 0
     progress_bar = render_progress_bar(rate)
-
     status_tag = "Optimal Pace 🟢" if month_missed == 0 else ("Minor Gaps 🟡" if month_missed <= 4 else "Attention Needed 🔴")
 
     nav_buttons = InlineKeyboardMarkup([
@@ -467,11 +515,13 @@ async def show_leaderboard(update_or_query, context: ContextTypes.DEFAULT_TYPE):
     def _query():
         conn = _get_db_connection()
         try:
-            return conn.execute(
-                "SELECT name, COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days "
-                "FROM attendance WHERE attendance_date LIKE ? AND status = 'present' GROUP BY user_id ORDER BY sessions DESC, days DESC LIMIT 10",
-                (f"{today[:7]}%",),
-            ).fetchall()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT name, COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days "
+                    "FROM attendance WHERE attendance_date LIKE %s AND status = 'present' GROUP BY user_id, name ORDER BY sessions DESC, days DESC LIMIT 10",
+                    (f"{today[:7]}%",),
+                )
+                return cur.fetchall()
         finally:
             conn.close()
 
@@ -498,14 +548,22 @@ async def show_group_report(update_or_query, context: ContextTypes.DEFAULT_TYPE)
     def _query():
         conn = _get_db_connection()
         try:
-            today_sits = conn.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date = ? AND status = 'present'", (today,)).fetchone()[0]
-            month_sits = conn.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date LIKE ? AND status = 'present'", (f"{month}%",)).fetchone()[0]
-            total_sits = conn.execute("SELECT COUNT(*) FROM attendance WHERE status = 'present'").fetchone()[0]
-            active_members = conn.execute(
-                "SELECT name, COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days "
-                "FROM attendance WHERE attendance_date LIKE ? AND status = 'present' GROUP BY user_id ORDER BY sessions DESC, days DESC",
-                (f"{month}%",),
-            ).fetchall()
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date = %s AND status = 'present'", (today,))
+                today_sits = cur.fetchone()[0]
+
+                cur.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date LIKE %s AND status = 'present'", (f"{month}%",))
+                month_sits = cur.fetchone()[0]
+
+                cur.execute("SELECT COUNT(*) FROM attendance WHERE status = 'present'")
+                total_sits = cur.fetchone()[0]
+
+                cur.execute(
+                    "SELECT name, COUNT(*) as sessions, COUNT(DISTINCT attendance_date) as days "
+                    "FROM attendance WHERE attendance_date LIKE %s AND status = 'present' GROUP BY user_id, name ORDER BY sessions DESC, days DESC",
+                    (f"{month}%",),
+                )
+                active_members = cur.fetchall()
             return today_sits, month_sits, total_sits, active_members
         finally:
             conn.close()
@@ -523,61 +581,6 @@ async def show_group_report(update_or_query, context: ContextTypes.DEFAULT_TYPE)
         f"👥 *Active Roster*\n{member_lines}"
     )
     await reply(update_or_query, context, msg, reply_markup=build_main_keyboard())
-
-
-# =========================================================
-# HANDLERS
-# =========================================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today = get_current_date()
-    formatted_date = datetime.now(TIMEZONE).strftime("%A, %b %d")
-    month_prefix = today[:7]
-
-    def _query_today_roster():
-        conn = _get_db_connection()
-        try:
-            all_known = conn.execute(
-                "SELECT DISTINCT user_id, name FROM attendance WHERE attendance_date LIKE ?",
-                (f"{month_prefix}%",),
-            ).fetchall()
-
-            today_records = conn.execute(
-                "SELECT user_id, name FROM attendance WHERE attendance_date = ? AND status = 'present'",
-                (today,),
-            ).fetchall()
-
-            completed = [name for _, name in today_records]
-            completed_uids = {uid for uid, _ in today_records}
-            pending = [name for uid, name in all_known if uid not in completed_uids]
-
-            return completed, pending
-        finally:
-            conn.close()
-
-    completed, pending = await asyncio.to_thread(_query_today_roster)
-
-    if completed:
-        completed_str = " • ".join([f"`{esc(n)}`" for n in completed])
-    else:
-        completed_str = "`None`"
-
-    if pending:
-        pending_str = " • ".join([f"`{esc(n)}`" for n in pending])
-    else:
-        pending_str = "`None`"
-
-    msg = (
-        f"🧘 *MEDITATION DASHBOARD*\n"
-        f"`{esc(formatted_date)} • 20m Sit`\n"
-        f"─────────────────────────────\n"
-        f"🟢 Done \\({len(completed)}\\): {completed_str}\n"
-        f"🔴 Left \\({len(pending)}\\): {pending_str}\n"
-        f"─────────────────────────────\n"
-        f"Select an option below:"
-    )
-
-    await reply(update, context, msg, reply_markup=build_main_keyboard(today))
 
 
 async def handle_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -653,7 +656,6 @@ async def button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, date_str, session = data.split(":")
         await query.answer()
 
-        # Animation Step 1: Loading state
         await query.edit_message_reply_markup(
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⏳ Saving Check-In...", callback_data="noop")]
@@ -666,19 +668,14 @@ async def button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if success:
             streak = await calculate_streak(user.id)
             streak_text = f"{streak}d Streak! 🔥" if streak > 1 else "Checked In! ✨"
-            
-            # Animation Step 2: Success state
             await query.edit_message_reply_markup(
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(f"✅ {streak_text}", callback_data="noop")]
                 ])
             )
             await asyncio.sleep(0.8)
-            
-            # Animation Step 3: Clean return to dashboard
             await start(query, context)
         else:
-            # Animation Step 2 (Error): Already Checked In
             await query.edit_message_reply_markup(
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("⚠️ Already Checked In Today", callback_data="noop")]
@@ -717,12 +714,14 @@ async def scheduled_unmarked_catchup(context: ContextTypes.DEFAULT_TYPE):
     def _query():
         conn = _get_db_connection()
         try:
-            return conn.execute("""
-                SELECT DISTINCT user_id, name FROM attendance 
-                WHERE attendance_date LIKE ? AND user_id NOT IN (
-                    SELECT user_id FROM attendance WHERE attendance_date = ? AND status = 'present'
-                )
-            """, (f"{month}%", today)).fetchall()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT DISTINCT user_id, name FROM attendance 
+                    WHERE attendance_date LIKE %s AND user_id NOT IN (
+                        SELECT user_id FROM attendance WHERE attendance_date = %s AND status = 'present'
+                    )
+                """, (f"{month}%", today))
+                return cur.fetchall()
         finally:
             conn.close()
 
@@ -800,7 +799,7 @@ async def main():
         except NotImplementedError:
             pass
 
-    logger.info("Starting Telegram polling...")
+    logger.info("Starting Telegram polling with Neon Postgres...")
     async with app:
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)

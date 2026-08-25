@@ -30,7 +30,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("BOT_TOKEN", "8046423951:AAG8NqC9yh5sgeGuE4rHdXCW7DwOPQ7oANI")
+TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 GROUP_ID = int(os.getenv("GROUP_ID", "-4721378655"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 TIMEZONE = ZoneInfo("Asia/Kolkata")
@@ -42,7 +42,6 @@ SESSION_MINUTES = 20
 # =========================================================
 
 def esc(text: any) -> str:
-    """Escapes strings safely for Telegram MarkdownV2."""
     if text is None:
         return ""
     return escape_markdown(str(text), version=2)
@@ -87,13 +86,31 @@ def generate_color_grid(year: int, month: int, attended_days: Set[int], current_
 
 
 # =========================================================
-# DATABASE LAYER (NEON POSTGRESQL)
+# RESILIENT DATABASE LAYER (NEON POSTGRESQL)
 # =========================================================
 
 def _get_db_connection():
     if not DATABASE_URL:
-        raise ValueError("DATABASE_URL environment variable is missing! Please set it in Render.")
-    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+        raise ValueError("DATABASE_URL environment variable is missing!")
+    
+    # Retry up to 3 times to allow Neon compute wake-up
+    last_err = None
+    for _ in range(3):
+        try:
+            conn = psycopg2.connect(
+                DATABASE_URL, 
+                connect_timeout=15, 
+                keepalives=1, 
+                keepalives_idle=30, 
+                keepalives_interval=10, 
+                keepalives_count=5
+            )
+            return conn
+        except Exception as e:
+            last_err = e
+            import time as t
+            t.sleep(1)
+    raise last_err
 
 
 def _setup_database_sync() -> None:
@@ -295,7 +312,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             conn.close()
 
-    completed, pending = await asyncio.to_thread(_query_today_roster)
+    try:
+        completed, pending = await asyncio.to_thread(_query_today_roster)
+    except Exception as e:
+        logger.error(f"DB error in start: {e}")
+        completed, pending = [], []
 
     completed_str = " • ".join([f"`{esc(n)}`" for n in completed]) if completed else "`None`"
     pending_str = " • ".join([f"`{esc(n)}`" for n in pending]) if pending else "`None`"
@@ -651,7 +672,6 @@ async def button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await start(query, context)
         return
 
-    # Dynamic Morphing Button Animation
     if data.startswith("attend:"):
         _, date_str, session = data.split(":")
         await query.answer()
@@ -661,7 +681,7 @@ async def button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("⏳ Saving Check-In...", callback_data="noop")]
             ])
         )
-        await asyncio.sleep(0.35)
+        await asyncio.sleep(0.2)
 
         success = await record_attendance(user.id, name, date_str, session)
 
@@ -681,7 +701,7 @@ async def button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("⚠️ Already Checked In Today", callback_data="noop")]
                 ])
             )
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(1.0)
             await start(query, context)
 
 
@@ -744,7 +764,7 @@ async def scheduled_unmarked_catchup(context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# WEB SERVER & APPLICATION RUNNER
+# WEB SERVER & ERROR HANDLING
 # =========================================================
 
 async def handle_ping(request):
@@ -760,8 +780,12 @@ async def run_web_server() -> web.AppRunner:
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"Render HTTP health check server live on 0.0.0.0:{port}")
+    logger.info(f"Health check server active on port {port}")
     return runner
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception while handling an update:", exc_info=context.error)
 
 
 async def main():
@@ -769,6 +793,7 @@ async def main():
     await setup_database()
 
     app = Application.builder().token(TOKEN).build()
+    app.add_error_handler(error_handler)
 
     schedules = [
         (scheduled_community_prompt, time(5, 0, tzinfo=TIMEZONE), "Morning Meditation (5:00 AM)"),
@@ -791,25 +816,22 @@ async def main():
     app.add_handler(CommandHandler("id", lambda u, c: reply(u, c, f"Chat ID: `{esc(u.effective_chat.id)}`")))
     app.add_handler(CallbackQueryHandler(button_pressed))
 
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop_event.set)
-        except NotImplementedError:
-            pass
-
     logger.info("Starting Telegram polling with Neon Postgres...")
     async with app:
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
-        await stop_event.wait()
         
-        logger.info("Shutdown signal received. Stopping services...")
-        await app.updater.stop()
-        await app.stop()
-        await web_runner.cleanup()
-        logger.info("Bot terminated cleanly.")
+        # Idle loop that keeps the container and event loop alive
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            pass
+        finally:
+            logger.info("Shutting down...")
+            await app.updater.stop()
+            await app.stop()
+            await web_runner.cleanup()
 
 
 if __name__ == "__main__":

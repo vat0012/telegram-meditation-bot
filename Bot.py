@@ -334,31 +334,53 @@ async def reply(update_or_query: Any, context: ContextTypes.DEFAULT_TYPE, text: 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = get_current_date()
     formatted_date = datetime.now(TIMEZONE).strftime("%A, %b %d")
-    month_prefix = today[:7]
 
     @db_retry(max_retries=3)
     def _query_today_roster():
         with get_db_cursor() as cur:
-            cur.execute(
-                "SELECT DISTINCT user_id, name FROM attendance WHERE attendance_date LIKE %s ORDER BY name ASC",
-                (f"{month_prefix}%",),
-            )
+            # Query all registered members
+            cur.execute("SELECT DISTINCT user_id, name FROM attendance ORDER BY name ASC")
             all_known = cur.fetchall()
 
+            # Query today's present records
             cur.execute(
                 "SELECT user_id, name FROM attendance WHERE attendance_date = %s AND status = 'present'",
                 (today,),
             )
             today_records = cur.fetchall()
 
+            # Pre-fetch attendance dates for instant streak calculation
+            cur.execute(
+                "SELECT user_id, attendance_date FROM attendance WHERE status = 'present' ORDER BY attendance_date DESC"
+            )
+            all_attendance = cur.fetchall()
+
+        user_dates = {}
+        for uid, a_date in all_attendance:
+            if uid not in user_dates:
+                user_dates[uid] = set()
+            user_dates[uid].add(datetime.strptime(a_date, "%Y-%m-%d").date())
+
+        today_dt = datetime.now(TIMEZONE).date()
+        yesterday_dt = today_dt - timedelta(days=1)
         completed_uids = {uid for uid, _ in today_records}
 
         roster_lines = []
         for uid, name in all_known:
+            dates = user_dates.get(uid, set())
+            current_check = today_dt if today_dt in dates else yesterday_dt
+            streak = 0
+            if current_check in dates:
+                while current_check in dates:
+                    streak += 1
+                    current_check -= timedelta(days=1)
+
+            streak_tag = f" \\(🔥 `{streak}d`\\)" if streak > 0 else ""
+
             if uid in completed_uids:
-                roster_lines.append(f"🟩 `{esc(name)}`")
+                roster_lines.append(f"🟩 `{esc(name)}`{streak_tag}")
             else:
-                roster_lines.append(f"🟥 `{esc(name)}`")
+                roster_lines.append(f"🟥 `{esc(name)}`{streak_tag}")
 
         completed_count = len(completed_uids)
         total_members = len(all_known)
@@ -370,7 +392,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         roster_lines, completed_count, remaining_count, rate = await asyncio.to_thread(_query_today_roster)
     except Exception as e:
-        logger.error(f"Failed to load roster in start handler: {e}")
+        logger.error(f"Failed to load roster in start handler: {e}", exc_info=True)
         roster_lines = ["_No members registered yet_"]
         completed_count, remaining_count, rate = 0, 0, 0
 
@@ -755,52 +777,65 @@ async def button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def scheduled_community_prompt(context: ContextTypes.DEFAULT_TYPE):
     title = context.job.data
     today = get_current_date()
+    logger.info(f"Firing scheduled job: {title}")
     msg = (
         f"🧘 *{esc(title)}*\n"
         f"`{esc(today)}` • `20m Session`\n"
         f"────────────────────────────\n"
         f"Take a breath and check in below:"
     )
-    await context.bot.send_message(
-        chat_id=GROUP_ID,
-        text=msg,
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=build_main_keyboard(today),
-    )
+    try:
+        await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text=msg,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=build_main_keyboard(today),
+        )
+    except Exception as e:
+        logger.error(f"Error executing {title}: {e}", exc_info=True)
 
 
 async def scheduled_unmarked_catchup(context: ContextTypes.DEFAULT_TYPE):
     title = context.job.data
     today = get_current_date()
-    month = today[:7]
+    logger.info(f"Firing scheduled catch-up job: {title}")
 
     @db_retry(max_retries=3)
     def _query():
         with get_db_cursor() as cur:
+            # Query all registered members who have not checked in today
             cur.execute("""
                 SELECT DISTINCT user_id, name FROM attendance 
-                WHERE attendance_date LIKE %s AND user_id NOT IN (
-                    SELECT user_id FROM attendance WHERE attendance_date = %s AND status = 'present'
+                WHERE user_id NOT IN (
+                    SELECT user_id FROM attendance 
+                    WHERE attendance_date = %s AND status = 'present'
                 )
-            """, (f"{month}%", today))
+            """, (today,))
             return cur.fetchall()
 
-    unmarked = await asyncio.to_thread(_query)
-    if not unmarked:
-        return
+    try:
+        unmarked = await asyncio.to_thread(_query)
+        logger.info(f"[{title}] Unmarked members found: {len(unmarked)}")
+        
+        if not unmarked:
+            logger.info(f"[{title}] Everyone has already checked in. Skipping notice.")
+            return
 
-    names = ", ".join([esc(name) for _, name in unmarked])
-    msg = (
-        f"🔔 *{esc(title)}*\n"
-        f"────────────────────────────\n"
-        f"Pending practice check\\-ins for today:\n{names}"
-    )
-    await context.bot.send_message(
-        chat_id=GROUP_ID,
-        text=msg,
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=build_main_keyboard(today),
-    )
+        names = " • ".join([f"`{esc(name)}`" for _, name in unmarked])
+        msg = (
+            f"🔔 *{esc(title)}*\n"
+            f"────────────────────────────\n"
+            f"Pending practice check\\-ins for today:\n{names}\n\n"
+            f"Take 20 minutes to sit and check in below:"
+        )
+        await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text=msg,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=build_main_keyboard(today),
+        )
+    except Exception as e:
+        logger.error(f"Error executing {title}: {e}", exc_info=True)
 
 
 # =========================================================

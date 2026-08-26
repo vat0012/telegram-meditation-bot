@@ -349,7 +349,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             today_records = cur.fetchall()
 
-        # Build map of completed users with formatted timestamp in TIMEZONE
         completed_map = {}
         for uid, _, created_at in today_records:
             if created_at:
@@ -671,6 +670,9 @@ async def handle_grid_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not query:
+        return
+
     data = query.data
     user = query.from_user
     name = user.full_name or user.username or "Unknown"
@@ -721,38 +723,78 @@ async def button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await start(query, context)
         return
 
-    # Dynamic Morphing Check-in Button
+    # Dynamic Morphing Check-in Button with Failsafe
     if data.startswith("attend:"):
         _, date_str, session = data.split(":")
         await query.answer()
 
-        await query.edit_message_reply_markup(
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⏳ Saving Check-In...", callback_data="noop")]
-            ])
-        )
-        await asyncio.sleep(0.2)
-
-        success = await record_attendance(user.id, name, date_str, session)
-
-        if success:
-            streak = await calculate_streak(user.id)
-            streak_text = f"{streak}d Streak! 🔥" if streak > 1 else "Checked In! ✨"
+        try:
             await query.edit_message_reply_markup(
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"✅ {streak_text}", callback_data="noop")]
+                    [InlineKeyboardButton("⏳ Saving Check-In...", callback_data="noop")]
                 ])
             )
-            await asyncio.sleep(0.8)
-            await start(query, context)
-        else:
-            await query.edit_message_reply_markup(
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⚠️ Already Checked In Today", callback_data="noop")]
-                ])
+        except Exception as e:
+            logger.debug(f"Could not edit message markup to saving state: {e}")
+
+        try:
+            success = await asyncio.wait_for(
+                record_attendance(user.id, name, date_str, session),
+                timeout=10.0
             )
-            await asyncio.sleep(1.0)
-            await start(query, context)
+
+            if success:
+                streak = await calculate_streak(user.id)
+                streak_text = f"{streak}d Streak! 🔥" if streak > 1 else "Checked In! ✨"
+                try:
+                    await query.edit_message_reply_markup(
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton(f"✅ {streak_text}", callback_data="noop")]
+                        ])
+                    )
+                    await asyncio.sleep(0.8)
+                except Exception:
+                    pass
+            else:
+                try:
+                    await query.edit_message_reply_markup(
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("⚠️ Already Checked In Today", callback_data="noop")]
+                        ])
+                    )
+                    await asyncio.sleep(1.0)
+                except Exception:
+                    pass
+
+        except asyncio.TimeoutError:
+            logger.error(f"Database timeout during check-in for user {user.id}")
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⚠️ Connection Timeout, Retrying...", callback_data="noop")]
+                    ])
+                )
+                await asyncio.sleep(1.0)
+            except Exception:
+                pass
+
+        except Exception as err:
+            logger.error(f"Unexpected error during check-in: {err}", exc_info=True)
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ Error Occurred", callback_data="noop")]
+                    ])
+                )
+                await asyncio.sleep(1.0)
+            except Exception:
+                pass
+
+        finally:
+            try:
+                await start(query, context)
+            except Exception as e:
+                logger.error(f"Failed to refresh menu after check-in: {e}", exc_info=True)
 
 
 # =========================================================
@@ -788,7 +830,6 @@ async def scheduled_unmarked_catchup(context: ContextTypes.DEFAULT_TYPE):
     @db_retry(max_retries=3)
     def _query():
         with get_db_cursor() as cur:
-            # Query all registered members who have not checked in today
             cur.execute("""
                 SELECT DISTINCT user_id, name FROM attendance 
                 WHERE user_id NOT IN (
@@ -866,12 +907,9 @@ async def main():
 
     # Schedule Cron Alerts
     schedules = [
-        # Regular community prompts
         (scheduled_community_prompt, time(9, 0, tzinfo=TIMEZONE), "Morning Meditation (9:00 AM)"),
         (scheduled_community_prompt, time(18, 0, tzinfo=TIMEZONE), "Evening Meditation (6:00 PM)"),
-        
-        # Catch-up reminders for members who haven't given attendance
-        (scheduled_unmarked_catchup, time(10, 00, tzinfo=TIMEZONE), "Morning Catch-up (10:00 AM)"),
+        (scheduled_unmarked_catchup, time(10, 0, tzinfo=TIMEZONE), "Morning Catch-up (10:00 AM)"),
         (scheduled_unmarked_catchup, time(19, 0, tzinfo=TIMEZONE), "Evening Catch-up (7:00 PM)"),
     ]
     for callback, schedule_time, title in schedules:

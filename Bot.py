@@ -38,7 +38,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TIMEZONE = ZoneInfo("Asia/Kolkata")
 SESSION_MINUTES = 20
 
-# Global Connection Pool reference
 DB_POOL: Optional[pool.ThreadedConnectionPool] = None
 
 
@@ -99,30 +98,29 @@ def generate_color_grid(
 
 
 # =========================================================
-# RESILIENT DATABASE LAYER (CONNECTION POOL + RETRIES)
+# RESILIENT DATABASE LAYER
 # =========================================================
 
 def init_db_pool() -> None:
-    """Initializes a thread-safe connection pool for Postgres/Neon."""
+    """Initializes a thread-safe connection pool for Postgres."""
     global DB_POOL
     if not DATABASE_URL:
-        raise ValueError("DATABASE_URL environment variable is missing! Please configure it in your dashboard.")
+        raise ValueError("DATABASE_URL environment variable is missing!")
     
     DB_POOL = pool.ThreadedConnectionPool(
         minconn=2,
-        maxconn=10,
+        maxconn=20,
         dsn=DATABASE_URL,
-        connect_timeout=15,
+        connect_timeout=10,
         keepalives=1,
         keepalives_idle=30,
         keepalives_interval=10,
         keepalives_count=5,
     )
-    logger.info("PostgreSQL connection pool initialized successfully.")
+    logger.info("PostgreSQL connection pool initialized.")
 
 
 def close_db_pool() -> None:
-    """Closes all pooled database connections cleanly."""
     global DB_POOL
     if DB_POOL and not DB_POOL.closed:
         DB_POOL.closeall()
@@ -131,7 +129,6 @@ def close_db_pool() -> None:
 
 @contextmanager
 def get_db_cursor() -> Generator[Any, None, None]:
-    """Safe context manager to acquire and return a pooled connection & cursor."""
     if DB_POOL is None:
         raise RuntimeError("Database pool has not been initialized.")
     
@@ -148,10 +145,10 @@ def get_db_cursor() -> Generator[Any, None, None]:
 
 
 def db_retry(max_retries: int = 3, backoff_factor: float = 0.5) -> Callable:
-    """Decorator to retry transient database connection failures (e.g., Neon cold-start)."""
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
+            import time as t
             last_err = None
             for attempt in range(1, max_retries + 1):
                 try:
@@ -160,10 +157,8 @@ def db_retry(max_retries: int = 3, backoff_factor: float = 0.5) -> Callable:
                     last_err = err
                     sleep_time = backoff_factor * (2 ** (attempt - 1))
                     logger.warning(
-                        f"Database operational error on attempt {attempt}/{max_retries} "
-                        f"in {func.__name__}: {err}. Retrying in {sleep_time:.2f}s..."
+                        f"Database error on attempt {attempt}/{max_retries} in {func.__name__}: {err}. Retrying in {sleep_time:.2f}s..."
                     )
-                    import time as t
                     t.sleep(sleep_time)
             logger.error(f"Function {func.__name__} failed after {max_retries} attempts.")
             raise last_err
@@ -193,7 +188,8 @@ def _setup_database_sync() -> None:
 
 
 @db_retry(max_retries=3)
-def _record_attendance_sync(user_id: int, name: str, date_str: str, session: str) -> bool:
+def _record_and_get_streak_sync(user_id: int, name: str, date_str: str, session: str) -> Tuple[bool, int]:
+    """Records attendance and computes streak within a single connection."""
     with get_db_cursor() as cur:
         cur.execute(
             """
@@ -207,8 +203,34 @@ def _record_attendance_sync(user_id: int, name: str, date_str: str, session: str
         inserted = cur.fetchone()
         if inserted:
             cur.execute("UPDATE attendance SET name = %s WHERE user_id = %s", (name, user_id))
-            return True
-        return False
+            is_new = True
+        else:
+            is_new = False
+
+        # Calculate streak inside the same cursor context
+        cur.execute(
+            "SELECT DISTINCT attendance_date FROM attendance WHERE user_id = %s AND status = 'present' ORDER BY attendance_date DESC",
+            (user_id,),
+        )
+        rows = cur.fetchall()
+
+    if not rows:
+        return is_new, 0
+
+    dates = {datetime.strptime(r[0], "%Y-%m-%d").date() for r in rows}
+    today = datetime.now(TIMEZONE).date()
+    yesterday = today - timedelta(days=1)
+
+    current_check = today if today in dates else yesterday
+    if current_check not in dates:
+        return is_new, 0
+
+    streak = 0
+    while current_check in dates:
+        streak += 1
+        current_check -= timedelta(days=1)
+
+    return is_new, streak
 
 
 @db_retry(max_retries=3)
@@ -223,7 +245,7 @@ def _calculate_streak_sync(user_id: int) -> int:
     if not rows:
         return 0
 
-    dates: Set = {datetime.strptime(r[0], "%Y-%m-%d").date() for r in rows}
+    dates = {datetime.strptime(r[0], "%Y-%m-%d").date() for r in rows}
     today = datetime.now(TIMEZONE).date()
     yesterday = today - timedelta(days=1)
 
@@ -249,8 +271,8 @@ async def setup_database() -> None:
     await asyncio.to_thread(_setup_database_sync)
 
 
-async def record_attendance(user_id: int, name: str, date_str: str, session: str = "daily") -> bool:
-    return await asyncio.to_thread(_record_attendance_sync, user_id, name, date_str, session)
+async def record_and_get_streak(user_id: int, name: str, date_str: str, session: str = "daily") -> Tuple[bool, int]:
+    return await asyncio.to_thread(_record_and_get_streak_sync, user_id, name, date_str, session)
 
 
 async def calculate_streak(user_id: int) -> int:
@@ -723,78 +745,30 @@ async def button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await start(query, context)
         return
 
-    # Dynamic Morphing Check-in Button with Failsafe
+    # Instant Non-Blocking Check-In
     if data.startswith("attend:"):
         _, date_str, session = data.split(":")
-        await query.answer()
 
         try:
-            await query.edit_message_reply_markup(
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⏳ Saving Check-In...", callback_data="noop")]
-                ])
-            )
-        except Exception as e:
-            logger.debug(f"Could not edit message markup to saving state: {e}")
-
-        try:
-            success = await asyncio.wait_for(
-                record_attendance(user.id, name, date_str, session),
-                timeout=10.0
+            is_new, streak = await asyncio.wait_for(
+                record_and_get_streak(user.id, name, date_str, session),
+                timeout=8.0
             )
 
-            if success:
-                streak = await calculate_streak(user.id)
-                streak_text = f"{streak}d Streak! 🔥" if streak > 1 else "Checked In! ✨"
-                try:
-                    await query.edit_message_reply_markup(
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton(f"✅ {streak_text}", callback_data="noop")]
-                        ])
-                    )
-                    await asyncio.sleep(0.8)
-                except Exception:
-                    pass
+            if is_new:
+                streak_text = f"🔥 {streak}d Streak!" if streak > 1 else "✨ Checked In!"
+                await query.answer(f"Checked in! {streak_text}", show_alert=False)
             else:
-                try:
-                    await query.edit_message_reply_markup(
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("⚠️ Already Checked In Today", callback_data="noop")]
-                        ])
-                    )
-                    await asyncio.sleep(1.0)
-                except Exception:
-                    pass
+                await query.answer("You've already checked in today! 🧘", show_alert=False)
 
         except asyncio.TimeoutError:
-            logger.error(f"Database timeout during check-in for user {user.id}")
-            try:
-                await query.edit_message_reply_markup(
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⚠️ Connection Timeout, Retrying...", callback_data="noop")]
-                    ])
-                )
-                await asyncio.sleep(1.0)
-            except Exception:
-                pass
-
+            logger.error(f"Timeout during check-in for user {user.id}")
+            await query.answer("Connection timed out. Please retry.", show_alert=True)
         except Exception as err:
-            logger.error(f"Unexpected error during check-in: {err}", exc_info=True)
-            try:
-                await query.edit_message_reply_markup(
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("❌ Error Occurred", callback_data="noop")]
-                    ])
-                )
-                await asyncio.sleep(1.0)
-            except Exception:
-                pass
-
+            logger.error(f"Error during check-in: {err}", exc_info=True)
+            await query.answer("Could not record check-in. Try again.", show_alert=True)
         finally:
-            try:
-                await start(query, context)
-            except Exception as e:
-                logger.error(f"Failed to refresh menu after check-in: {e}", exc_info=True)
+            await start(query, context)
 
 
 # =========================================================
@@ -932,14 +906,13 @@ async def main():
         try:
             loop.add_signal_handler(sig, stop_event.set)
         except NotImplementedError:
-            pass  # Windows compatibility fallback
+            pass
 
     logger.info("Starting Telegram polling with Neon Postgres & Connection Pooling...")
     async with app:
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
         
-        # Block until termination signal is caught
         await stop_event.wait()
         
         logger.info("Termination signal received. Gracefully stopping services...")

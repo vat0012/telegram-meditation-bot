@@ -340,7 +340,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     def _query_today_roster():
         with get_db_cursor() as cur:
             cur.execute(
-                "SELECT DISTINCT user_id, name FROM attendance WHERE attendance_date LIKE %s",
+                "SELECT DISTINCT user_id, name FROM attendance WHERE attendance_date LIKE %s ORDER BY name ASC",
                 (f"{month_prefix}%",),
             )
             all_known = cur.fetchall()
@@ -351,28 +351,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             today_records = cur.fetchall()
 
-        completed = [name for _, name in today_records]
         completed_uids = {uid for uid, _ in today_records}
-        pending = [name for uid, name in all_known if uid not in completed_uids]
-        return completed, pending
+
+        roster_lines = []
+        for uid, name in all_known:
+            if uid in completed_uids:
+                roster_lines.append(f"🟩 `{esc(name)}`")
+            else:
+                roster_lines.append(f"🟥 `{esc(name)}`")
+
+        completed_count = len(completed_uids)
+        total_members = len(all_known)
+        remaining_count = max(0, total_members - completed_count)
+        rate = int((completed_count / total_members) * 100) if total_members > 0 else 0
+
+        return roster_lines, completed_count, remaining_count, rate
 
     try:
-        completed, pending = await asyncio.to_thread(_query_today_roster)
+        roster_lines, completed_count, remaining_count, rate = await asyncio.to_thread(_query_today_roster)
     except Exception as e:
         logger.error(f"Failed to load roster in start handler: {e}")
-        completed, pending = [], []
+        roster_lines = ["_No members registered yet_"]
+        completed_count, remaining_count, rate = 0, 0, 0
 
-    completed_str = " • ".join([f"`{esc(n)}`" for n in completed]) if completed else "`None`"
-    pending_str = " • ".join([f"`{esc(n)}`" for n in pending]) if pending else "`None`"
+    roster_text = "\n".join(roster_lines) if roster_lines else "_No members registered yet_"
+    progress_bar = render_progress_bar(rate, total_blocks=8)
 
     msg = (
-        f"🧘 *MEDITATION DASHBOARD*\n"
-        f"`{esc(formatted_date)} • 20m Sit`\n"
-        f"─────────────────────────────\n"
-        f"🟢 Done \\({len(completed)}\\): {completed_str}\n"
-        f"🔴 Left \\({len(pending)}\\): {pending_str}\n"
-        f"─────────────────────────────\n"
-        f"Select an option below:"
+        f"🧘 *TM SESSIONS DASHBOARD*\n"
+        f"*{esc(formatted_date)}* • `{SESSION_MINUTES}m Daily`\n"
+        f"`{progress_bar}` `{rate}% Done \\({completed_count}/{completed_count + remaining_count}\\)`\n"
+        f"────────────────────────────\n\n"
+        f"{roster_text}\n\n"
+        f"────────────────────────────\n"
+        f"*Summary:* `{completed_count} Checked In` • `{remaining_count} Remaining`\n\n"
+        f"👇 *Select an option below:*"
     )
 
     await reply(update, context, msg, reply_markup=build_main_keyboard(today))

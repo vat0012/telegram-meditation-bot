@@ -183,8 +183,10 @@ def _setup_database_sync() -> None:
                 session TEXT NOT NULL,
                 duration_minutes INTEGER DEFAULT 20,
                 status TEXT DEFAULT 'present',
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
                 CONSTRAINT unique_user_date_session UNIQUE(user_id, attendance_date, session)
             );
+            ALTER TABLE attendance ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
             CREATE INDEX IF NOT EXISTS idx_user_date ON attendance(user_id, attendance_date);
             CREATE INDEX IF NOT EXISTS idx_date_user ON attendance(attendance_date, user_id);
         """)
@@ -195,8 +197,8 @@ def _record_attendance_sync(user_id: int, name: str, date_str: str, session: str
     with get_db_cursor() as cur:
         cur.execute(
             """
-            INSERT INTO attendance (user_id, name, attendance_date, session, duration_minutes, status)
-            VALUES (%s, %s, %s, %s, %s, 'present')
+            INSERT INTO attendance (user_id, name, attendance_date, session, duration_minutes, status, created_at)
+            VALUES (%s, %s, %s, %s, %s, 'present', NOW())
             ON CONFLICT (user_id, attendance_date, session) DO NOTHING
             RETURNING id;
             """,
@@ -338,51 +340,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     @db_retry(max_retries=3)
     def _query_today_roster():
         with get_db_cursor() as cur:
-            # Query all registered members
             cur.execute("SELECT DISTINCT user_id, name FROM attendance ORDER BY name ASC")
             all_known = cur.fetchall()
 
-            # Query today's present records
             cur.execute(
-                "SELECT user_id, name FROM attendance WHERE attendance_date = %s AND status = 'present'",
+                "SELECT user_id, name, created_at FROM attendance WHERE attendance_date = %s AND status = 'present'",
                 (today,),
             )
             today_records = cur.fetchall()
 
-            # Pre-fetch attendance dates for instant streak calculation
-            cur.execute(
-                "SELECT user_id, attendance_date FROM attendance WHERE status = 'present' ORDER BY attendance_date DESC"
-            )
-            all_attendance = cur.fetchall()
-
-        user_dates = {}
-        for uid, a_date in all_attendance:
-            if uid not in user_dates:
-                user_dates[uid] = set()
-            user_dates[uid].add(datetime.strptime(a_date, "%Y-%m-%d").date())
-
-        today_dt = datetime.now(TIMEZONE).date()
-        yesterday_dt = today_dt - timedelta(days=1)
-        completed_uids = {uid for uid, _ in today_records}
+        # Build map of completed users with formatted timestamp in TIMEZONE
+        completed_map = {}
+        for uid, _, created_at in today_records:
+            if created_at:
+                local_time = created_at.astimezone(TIMEZONE).strftime("%I:%M %p")
+                completed_map[uid] = local_time
+            else:
+                completed_map[uid] = ""
 
         roster_lines = []
         for uid, name in all_known:
-            dates = user_dates.get(uid, set())
-            current_check = today_dt if today_dt in dates else yesterday_dt
-            streak = 0
-            if current_check in dates:
-                while current_check in dates:
-                    streak += 1
-                    current_check -= timedelta(days=1)
-
-            streak_tag = f" \\(🔥 `{streak}d`\\)" if streak > 0 else ""
-
-            if uid in completed_uids:
-                roster_lines.append(f"🟩 `{esc(name)}`{streak_tag}")
+            if uid in completed_map:
+                time_str = completed_map[uid]
+                time_tag = f" \\(`{esc(time_str)}`\\)" if time_str else ""
+                roster_lines.append(f"🟩 `{esc(name)}`{time_tag}")
             else:
-                roster_lines.append(f"🟥 `{esc(name)}`{streak_tag}")
+                roster_lines.append(f"🟥 `{esc(name)}`")
 
-        completed_count = len(completed_uids)
+        completed_count = len(completed_map)
         total_members = len(all_known)
         remaining_count = max(0, total_members - completed_count)
         rate = int((completed_count / total_members) * 100) if total_members > 0 else 0
@@ -879,14 +864,14 @@ async def main():
     app = Application.builder().token(TOKEN).build()
     app.add_error_handler(error_handler)
 
-    # Schedule Cron Alerts (Configured for 10:37 test)
+    # Schedule Cron Alerts
     schedules = [
-        # Catch-up reminder set to test at 10:37 AM
-        (scheduled_unmarked_catchup, time(10, 40, tzinfo=TIMEZONE), "Morning Catch-up (10:37 AM)"),
-        
-        # Standard daily schedules
+        # Regular community prompts
         (scheduled_community_prompt, time(9, 0, tzinfo=TIMEZONE), "Morning Meditation (9:00 AM)"),
         (scheduled_community_prompt, time(18, 0, tzinfo=TIMEZONE), "Evening Meditation (6:00 PM)"),
+        
+        # Catch-up reminders for members who haven't given attendance
+        (scheduled_unmarked_catchup, time(10, 0, tzinfo=TIMEZONE), "Morning Catch-up (10:00 AM)"),
         (scheduled_unmarked_catchup, time(19, 0, tzinfo=TIMEZONE), "Evening Catch-up (7:00 PM)"),
     ]
     for callback, schedule_time, title in schedules:

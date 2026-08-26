@@ -871,7 +871,7 @@ async def main():
         (scheduled_community_prompt, time(18, 0, tzinfo=TIMEZONE), "Evening Meditation (6:00 PM)"),
         
         # Catch-up reminders for members who haven't given attendance
-        (scheduled_unmarked_catchup, time(10, 0, tzinfo=TIMEZONE), "Morning Catch-up (10:46 AM)"),
+        (scheduled_unmarked_catchup, time(10, 47, tzinfo=TIMEZONE), "Morning Catch-up (10:00 AM)"),
         (scheduled_unmarked_catchup, time(19, 0, tzinfo=TIMEZONE), "Evening Catch-up (7:00 PM)"),
     ]
     for callback, schedule_time, title in schedules:

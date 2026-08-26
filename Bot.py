@@ -833,13 +833,13 @@ async def main():
 
     # Schedule Cron Alerts
     schedules = [
-        (scheduled_community_prompt, time(5, 0, tzinfo=TIMEZONE), "Morning Meditation (5:00 AM)"),
-        (scheduled_community_prompt, time(8, 30, tzinfo=TIMEZONE), "Mid-Morning Meditation (8:30 AM)"),
-        (scheduled_community_prompt, time(13, 30, tzinfo=TIMEZONE), "Midday Pause (1:30 PM)"),
+        # Regular community prompts
+        (scheduled_community_prompt, time(9, 0, tzinfo=TIMEZONE), "Morning Meditation (9:00 AM)"),
         (scheduled_community_prompt, time(18, 0, tzinfo=TIMEZONE), "Evening Meditation (6:00 PM)"),
-        (scheduled_unmarked_catchup, time(19, 30, tzinfo=TIMEZONE), "Evening Catch-up (7:30 PM)"),
-        (scheduled_unmarked_catchup, time(21, 30, tzinfo=TIMEZONE), "Night Reminder (9:30 PM)"),
-        (scheduled_unmarked_catchup, time(23, 0, tzinfo=TIMEZONE), "Final Reminder (11:00 PM)"),
+        
+        # Catch-up reminders for members who haven't given attendance
+        (scheduled_unmarked_catchup, time(10, 0, tzinfo=TIMEZONE), "Morning Catch-up (10:00 AM)"),
+        (scheduled_unmarked_catchup, time(19, 0, tzinfo=TIMEZONE), "Evening Catch-up (7:00 PM)"),
     ]
     for callback, schedule_time, title in schedules:
         app.job_queue.run_daily(callback, schedule_time, data=title)

@@ -351,41 +351,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             today_records = cur.fetchall()
 
-            # Pre-fetch streak data for all members in one query
-            cur.execute(
-                "SELECT user_id, attendance_date FROM attendance WHERE status = 'present' ORDER BY attendance_date DESC"
-            )
-            all_attendance = cur.fetchall()
-
-        # Build attendance dates map per user
-        user_dates = {}
-        for uid, a_date in all_attendance:
-            if uid not in user_dates:
-                user_dates[uid] = set()
-            user_dates[uid].add(datetime.strptime(a_date, "%Y-%m-%d").date())
-
-        today_dt = datetime.now(TIMEZONE).date()
-        yesterday_dt = today_dt - timedelta(days=1)
-
         completed_uids = {uid for uid, _ in today_records}
 
         roster_lines = []
         for uid, name in all_known:
-            # Calculate streak
-            dates = user_dates.get(uid, set())
-            current_check = today_dt if today_dt in dates else yesterday_dt
-            streak = 0
-            if current_check in dates:
-                while current_check in dates:
-                    streak += 1
-                    current_check -= timedelta(days=1)
-
-            streak_tag = f" 🔥 `{streak}d`" if streak > 0 else ""
-
             if uid in completed_uids:
-                roster_lines.append(f"🟩 `{esc(name)}`{streak_tag}")
+                roster_lines.append(f"🟩 `{esc(name)}`")
             else:
-                roster_lines.append(f"🟥 `{esc(name)}`{streak_tag}")
+                roster_lines.append(f"🟥 `{esc(name)}`")
 
         completed_count = len(completed_uids)
         total_members = len(all_known)
